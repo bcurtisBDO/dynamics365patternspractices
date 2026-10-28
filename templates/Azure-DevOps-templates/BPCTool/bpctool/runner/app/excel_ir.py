@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
 
 IR_VERSION = "2026.10-1"
 
@@ -241,13 +242,20 @@ def parse_area_paths(path: Path) -> list[dict[str, Any]]:
 
     items: list[dict[str, Any]] = []
     current: list[str] = []
-    for row in rows[1:]:
+    for row_number, row in enumerate(rows[1:], start=2):
         team = _cell(row[team_col]) if team_col < len(row) else ""
         # Find the deepest level cell provided on this row.
         filled_at = None
         for offset, col in enumerate(level_cols):
             value = _cell(row[col]) if col < len(row) else ""
             if value:
+                if len(current) < offset:
+                    raise ValueError(
+                        f"Area paths sheet, row {row_number}: '{value}' is in the level {offset + 1} "
+                        f"column ({get_column_letter(col + 1)}), but there is no level {offset} area "
+                        "above it to put it under. Add the missing parent area on a row above, or "
+                        "move the value to the correct column, then try again."
+                    )
                 # Truncate deeper levels when a shallower cell is set.
                 current = current[:offset]
                 current.append(value)

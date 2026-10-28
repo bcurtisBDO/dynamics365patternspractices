@@ -39,18 +39,34 @@ _CASE_INSENSITIVE_FIELDS = _PATH_FIELDS | {MICROSOFT_ID.lower(), SEQUENCE_ID.low
 
 # kind → (CSV label, sort order)
 CHANGE_KINDS: dict[str, tuple[str, int]] = {
-    "exists_not_in_id_map": (
-        "Already in Azure DevOps, not in ado-id-map.csv — a live run would create a duplicate",
+    "ambiguous_match": (
+        "Several work items in Azure DevOps match this row — a live run doesn't create it",
         0,
     ),
-    "ambiguous_match": ("Several work items in Azure DevOps match this row", 1),
-    "field_changed": ("Field value differs", 2),
-    "parent_changed": ("Parent differs", 3),
-    "type_changed": ("Work item type differs", 4),
-    "missing_in_ado": ("Work item not found in Azure DevOps", 5),
-    "retired_in_workbook": ("Deprecated or deleted in the workbook — still in Azure DevOps", 6),
-    "not_in_workbook": ("In Azure DevOps, not in the workbook", 7),
-    "new_row": ("New row — a live run would create it", 8),
+    "blocked_by_ambiguous_parent": (
+        "Under a row that matches several work items — a live run doesn't create it until that row is sorted out",
+        1,
+    ),
+    "exists_not_in_id_map": (
+        "Already in Azure DevOps, not in ado-id-map.csv — a live run adds it to the map instead of creating it",
+        2,
+    ),
+    "matched_other_key": (
+        "Already in Azure DevOps under another key (same Microsoft ID) — a live run reuses it instead of creating it",
+        3,
+    ),
+    "key_reassigned": (
+        "Key now has another Microsoft ID — its earlier work item goes to the row with that ID; "
+        "a live run creates this row as a new item",
+        4,
+    ),
+    "field_changed": ("Field value differs", 5),
+    "parent_changed": ("Parent differs", 6),
+    "type_changed": ("Work item type differs", 7),
+    "missing_in_ado": ("Work item not found in Azure DevOps", 8),
+    "retired_in_workbook": ("Deprecated or deleted in the workbook — still in Azure DevOps", 9),
+    "not_in_workbook": ("In Azure DevOps, not in the workbook", 10),
+    "new_row": ("New row — a live run would create it", 11),
 }
 
 CSV_FIELDS = [
@@ -164,6 +180,28 @@ def _id_text(value: Any) -> str:
     return _text(value).strip().casefold()
 
 
+def ambiguous_change(draft: WorkItemDraft, work_item_ids: list[int]) -> Change:
+    return Change("ambiguous_match", draft.key, None, draft.work_item_type, draft.title,
+                  field_label="Microsoft ID", current=", ".join(f"#{i}" for i in sorted(work_item_ids)),
+                  workbook=_text(draft.fields.get(MICROSOFT_ID)),
+                  source_file=draft.source_file, source_row=draft.source_row)
+
+
+def matched_other_key_change(draft: WorkItemDraft, work_item_id: int, previous_keys: list[str]) -> Change:
+    was = f" (was key {', '.join(previous_keys)})" if previous_keys else " (not in ado-id-map.csv)"
+    return Change("matched_other_key", draft.key, work_item_id, draft.work_item_type, draft.title,
+                  field_label="Microsoft ID", current=f"#{work_item_id}{was}",
+                  workbook=_text(draft.fields.get(MICROSOFT_ID)),
+                  source_file=draft.source_file, source_row=draft.source_row)
+
+
+def key_reassigned_change(draft: WorkItemDraft, work_item_id: int) -> Change:
+    return Change("key_reassigned", draft.key, work_item_id, draft.work_item_type, draft.title,
+                  field_label="Microsoft ID", current=f"#{work_item_id} goes to another row",
+                  workbook=_text(draft.fields.get(MICROSOFT_ID)),
+                  source_file=draft.source_file, source_row=draft.source_row)
+
+
 def match_by_microsoft_id(
     reader: AdoClient,
     drafts: list[WorkItemDraft],
@@ -206,12 +244,7 @@ def match_by_microsoft_id(
         candidates = [i for i in candidates if i not in used]
         if len(candidates) > 1:
             used.update(candidates)
-            ambiguous.append(
-                Change("ambiguous_match", draft.key, None, draft.work_item_type, draft.title,
-                       field_label="Microsoft ID", current=", ".join(f"#{i}" for i in sorted(candidates)),
-                       workbook=_text(draft.fields.get(MICROSOFT_ID)),
-                       source_file=draft.source_file, source_row=draft.source_row)
-            )
+            ambiguous.append(ambiguous_change(draft, candidates))
         elif candidates:
             work_item_id = candidates[0]
             used.add(work_item_id)
@@ -225,6 +258,24 @@ def match_by_microsoft_id(
                          "WorkItemType": _text(fields.get("System.WorkItemType")),
                          "Title": _text(fields.get("System.Title"))})
     return rows, items, ambiguous
+
+
+def _held_ancestor(
+    draft: WorkItemDraft,
+    drafts_by_key: dict[str, WorkItemDraft],
+    imported: dict[str, Any],
+    held: set[str],
+) -> str:
+    """Key of the held ancestor a live run would wait on; "" when the chain reaches an imported item."""
+    seen = {draft.key}
+    parent = draft.parent_key
+    while parent and parent not in seen and parent not in imported:
+        if parent in held:
+            return parent
+        seen.add(parent)
+        ancestor = drafts_by_key.get(parent)
+        parent = ancestor.parent_key if ancestor else None
+    return ""
 
 
 def compare_with_azure_devops(
@@ -247,8 +298,10 @@ def compare_with_azure_devops(
     Only fields the workbook sets are compared (an empty cell is never reported).
     ``complete_workbook`` is False when drafts were capped, so missing rows aren't listed.
     ``retired_keys`` are rows skipped as Deprecated / Deleted; their items get their own kind.
-    ``items`` (already read) and ``ambiguous`` come from :func:`match_by_microsoft_id`;
-    then every matched row is also reported as a duplicate a live run would create.
+    ``items`` (already read) come from :func:`match_by_microsoft_id`; then every matched
+    row is also reported as not in ado-id-map.csv. ``ambiguous`` holds changes for rows a
+    live run won't create as listed (several matches, keys given to another row); they
+    aren't reported as new rows, and neither are new rows below a row with several matches.
     """
     matched_without_map = items is not None
     imported: dict[str, dict[str, str]] = {}
@@ -260,9 +313,18 @@ def compare_with_azure_devops(
 
     changes: list[Change] = list(ambiguous or [])
     unresolved = {change.key for change in changes}
+    held = {change.key for change in changes if change.kind == "ambiguous_match"}
     drafts_by_key = {draft.key: draft for draft in drafts}
     for draft in drafts:
         if draft.key not in imported and draft.key not in unresolved:
+            blocker = _held_ancestor(draft, drafts_by_key, imported, held)
+            if blocker:
+                changes.append(
+                    Change("blocked_by_ambiguous_parent", draft.key, None, draft.work_item_type, draft.title,
+                           field_label="Blocked by", workbook=blocker,
+                           source_file=draft.source_file, source_row=draft.source_row)
+                )
+                continue
             changes.append(
                 Change("new_row", draft.key, None, draft.work_item_type, draft.title,
                        source_file=draft.source_file, source_row=draft.source_row)

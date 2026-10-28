@@ -13,19 +13,21 @@ export default function CollapsibleSection({
 
   return (
     <section className="panel collapsible-panel">
-      <button
-        type="button"
-        className="panel-heading-row collapsible-trigger"
-        onClick={() => setOpen((value) => !value)}
-        aria-expanded={open}
-      >
-        <h2>{title}</h2>
-        <span className="collapse-meta">
-          <span className="collapse-caret" aria-hidden="true">
-            {open ? '▾' : '▸'}
+      <h2 className="collapsible-heading">
+        <button
+          type="button"
+          className="panel-heading-row collapsible-trigger"
+          onClick={() => setOpen((value) => !value)}
+          aria-expanded={open}
+        >
+          <span className="collapsible-title">{title}</span>
+          <span className="collapse-meta">
+            <span className="collapse-caret" aria-hidden="true">
+              {open ? '▾' : '▸'}
+            </span>
           </span>
-        </span>
-      </button>
+        </button>
+      </h2>
 
       {open ? (
         <div className="collapsible-body">{children}</div>

@@ -7,12 +7,13 @@ from pathlib import Path
 from typing import Annotated
 from urllib.parse import quote
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from .excel_ir import build_ir, find_template_workbook
-from .fs_browser import list_directory, list_roots
+from .fs_browser import NETWORK_PATH_ERROR, is_network_path, list_directory, list_roots
 from .jobs import (
     ApplyInProgressError,
     active_job_count,
@@ -34,6 +35,21 @@ app = FastAPI(
 # No CORS: the UI reaches the runner through the Vite /api proxy, so web pages on other
 # origins cannot read runner responses. The Host check blocks DNS-rebinding pages.
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost"])
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_error(_request: Request, exc: RequestValidationError) -> JSONResponse:
+    # FastAPI's default echoes the submitted values ("input"), which include the PAT.
+    errors = [
+        {
+            "loc": [part if isinstance(part, int) else str(part) for part in error.get("loc") or ()],
+            "msg": str(error.get("msg") or ""),
+            "type": str(error.get("type") or ""),
+        }
+        for error in exc.errors()
+    ]
+    return JSONResponse(status_code=422, content={"detail": errors})
+
 
 def _discover_template(release_folder: Path | None) -> Path | None:
     env = (os.environ.get("BPCTOOL_TEMPLATE") or "").strip()
@@ -134,6 +150,8 @@ def output_file(
     """Serve a known run output (report, failures, data checks) from the output root."""
     if name not in OUTPUT_FILES or "/" in folder or "\\" in folder or folder.startswith("."):
         raise HTTPException(status_code=404, detail="Unknown output file")
+    if root and is_network_path(root):
+        raise HTTPException(status_code=400, detail=NETWORK_PATH_ERROR)
     custom = Path(root).expanduser() if (root or "").strip() else None
     if custom is not None and not custom.is_absolute():
         raise HTTPException(status_code=400, detail="root must be an absolute path")

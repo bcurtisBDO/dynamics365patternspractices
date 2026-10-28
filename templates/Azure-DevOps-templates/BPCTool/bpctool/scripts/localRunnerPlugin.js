@@ -52,18 +52,22 @@ function runnerEnv(logger = console) {
   return { ...fromFile, ...process.env }
 }
 
-function resolveUvicorn() {
-  const candidates = [
-    path.join(ROOT, '.venv', 'bin', 'uvicorn'),
-    path.join(ROOT, '.venv', 'Scripts', 'uvicorn.exe'),
-  ]
-  return candidates.find((candidate) => existsSync(candidate)) || null
+// Console scripts such as .venv/bin/uvicorn embed the absolute interpreter path from when the
+// venv was created, so they break once the BPCTool folder is moved; `python -m` does not.
+function resolveVenvPython() {
+  const venvPython = path.join(
+    ROOT,
+    '.venv',
+    process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python',
+  )
+  return existsSync(venvPython) ? venvPython : null
 }
 
 /** First launch from a fresh copy (e.g. `npm start` without Start BPCTool): create the venv. */
 function runSetup(logger = console) {
   return new Promise((resolve, reject) => {
-    const setup = spawn(process.execPath, [path.join(__dirname, 'ensure-env.mjs')], {
+    // npm install would rewrite node_modules while Vite is running from it (EBUSY on Windows).
+    const setup = spawn(process.execPath, [path.join(__dirname, 'ensure-env.mjs'), '--python-only'], {
       cwd: ROOT,
       stdio: ['ignore', 'pipe', 'pipe'],
     })
@@ -82,7 +86,7 @@ function runSetup(logger = console) {
         reject(
           new Error(
             `First-launch setup failed (exit ${code}); see the [bpc-setup] lines above. ` +
-              'Python 3 must be installed and on PATH; then run: npm run setup',
+              'Python 3.11+ must be installed and on PATH; then run: npm run setup',
           ),
         )
       }
@@ -90,14 +94,38 @@ function runSetup(logger = console) {
   })
 }
 
-function waitForHealth(timeoutMs = 20000) {
+/** Resolves once the runner answers /health; rejects early if `child` exits first. */
+export function waitForHealth(child, { url = HEALTH, timeoutMs = 20000 } = {}) {
   const started = Date.now()
   return new Promise((resolve, reject) => {
+    let done = false
+    const finish = (error) => {
+      if (done) return
+      done = true
+      child.off('exit', onExit)
+      child.off('error', onExit)
+      if (error) {
+        reject(error)
+      } else {
+        resolve()
+      }
+    }
+    const onExit = () =>
+      finish(
+        new Error(
+          'The Python runner stopped while starting (see the [bpc-runner] lines above). ' +
+            'Close BPCTool and double-click "Start BPCTool" to repair the setup, or run: npm run setup',
+        ),
+      )
+    child.once('exit', onExit)
+    child.once('error', onExit)
+
     const tick = () => {
-      const req = http.get(HEALTH, (res) => {
+      if (done) return
+      const req = http.get(url, (res) => {
         res.resume()
         if (res.statusCode === 200) {
-          resolve()
+          finish()
           return
         }
         retry()
@@ -109,14 +137,33 @@ function waitForHealth(timeoutMs = 20000) {
       })
     }
     const retry = () => {
+      if (done) return
       if (Date.now() - started > timeoutMs) {
-        reject(new Error(`Local runner did not become healthy on ${HEALTH}`))
+        finish(new Error(`Local runner did not become healthy on ${url}`))
         return
       }
       setTimeout(tick, 250)
     }
     tick()
   })
+}
+
+/**
+ * Stop the runner and anything it started. On Windows the venv python.exe is a launcher that
+ * runs the real interpreter as a child, and --reload adds a worker; killing only the PID we
+ * spawned would leave those holding the port.
+ */
+export function killProcessTree(proc, { platform = process.platform, exec = execSync } = {}) {
+  if (!proc?.pid) return
+  try {
+    if (platform === 'win32') {
+      exec(`taskkill /PID ${proc.pid} /T /F`, { stdio: 'ignore' })
+    } else {
+      proc.kill('SIGTERM')
+    }
+  } catch {
+    // already gone
+  }
 }
 
 /**
@@ -203,6 +250,33 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
+/**
+ * `configure` hook for the /api proxy: while the runner is starting (or stopped) answer
+ * 502 without Vite's stack trace. The UI treats 502 as "runner not up yet" and retries.
+ */
+export function quietRunnerUnavailable(proxy) {
+  const emit = proxy.emit.bind(proxy)
+  proxy.emit = (event, error, req, res, ...rest) => {
+    if (event === 'error' && error?.code === 'ECONNREFUSED' && res && 'req' in res) {
+      if (!res.headersSent && !res.writableEnded) {
+        res.writeHead(502, { 'Content-Type': 'text/plain' }).end()
+      }
+      return true
+    }
+    return emit(event, error, req, res, ...rest)
+  }
+}
+
+// Opened here rather than with `vite --open` so the page's first runner calls don't race
+// the runner's startup. globalThis survives Vite re-importing this file on a config restart.
+function openBrowserOnce(server) {
+  if (typeof server.openBrowser !== 'function' || globalThis.__bpctoolBrowserOpened) {
+    return
+  }
+  globalThis.__bpctoolBrowserOpened = true
+  server.openBrowser()
+}
+
 export function localRunnerPlugin() {
   let child = null
   let owned = false
@@ -213,11 +287,7 @@ export function localRunnerPlugin() {
       return
     }
     shuttingDown = true
-    try {
-      child.kill('SIGTERM')
-    } catch {
-      // ignore
-    }
+    killProcessTree(child)
     child = null
     owned = false
   }
@@ -248,15 +318,15 @@ export function localRunnerPlugin() {
       await sleep(400)
     }
 
-    let uvicorn = resolveUvicorn()
-    if (!uvicorn) {
+    let python = resolveVenvPython()
+    if (!python) {
       logger.info?.(
         '[bpc-runner] Python runner venv not found — running first-launch setup (about a minute)...',
       )
       await runSetup(logger)
-      uvicorn = resolveUvicorn()
+      python = resolveVenvPython()
     }
-    if (!uvicorn) {
+    if (!python) {
       throw new Error(
         'Python runner venv still not found after setup. Double-click "Start BPCTool" or run: npm run setup',
       )
@@ -265,10 +335,14 @@ export function localRunnerPlugin() {
     // --reload restarts the runner on any code change, killing a run in progress (e.g. a
     // git pull mid-import), so only `npm run dev` uses it.
     const reload = process.env.npm_lifecycle_event === 'dev'
-    logger.info?.(`[bpc-runner] Starting ${uvicorn} on ${HOST}:${PORT}${reload ? ' (--reload)' : ''}`)
-    child = spawn(
-      uvicorn,
+    logger.info?.(
+      `[bpc-runner] Starting ${python} -m uvicorn on ${HOST}:${PORT}${reload ? ' (--reload)' : ''}`,
+    )
+    const runner = spawn(
+      python,
       [
+        '-m',
+        'uvicorn',
         'app.main:app',
         '--host',
         HOST,
@@ -282,41 +356,56 @@ export function localRunnerPlugin() {
         env: runnerEnv(logger),
       },
     )
+    child = runner
     owned = true
     shuttingDown = false
 
-    child.stdout?.on('data', (chunk) => {
+    runner.on('error', (error) => {
+      logger.error?.(
+        `[bpc-runner] Could not start the Python runner (${error.message}). ` +
+          'Close BPCTool and double-click "Start BPCTool" to repair the setup, or run: npm run setup',
+      )
+      if (child === runner) {
+        child = null
+        owned = false
+      }
+    })
+    runner.stdout?.on('data', (chunk) => {
       const text = String(chunk).trim()
       if (text) {
         logger.info?.(`[bpc-runner] ${text}`)
       }
     })
-    child.stderr?.on('data', (chunk) => {
+    runner.stderr?.on('data', (chunk) => {
       const text = String(chunk).trim()
       if (text) {
         logger.info?.(`[bpc-runner] ${text}`)
       }
     })
-    child.on('exit', (code, signal) => {
+    runner.on('exit', (code, signal) => {
       if (!shuttingDown && owned) {
         logger.error?.(
           `[bpc-runner] Exited unexpectedly (code=${code}, signal=${signal})`,
         )
       }
-      child = null
-      owned = false
+      if (child === runner) {
+        child = null
+        owned = false
+      }
     })
 
-    await waitForHealth()
+    await waitForHealth(runner)
     logger.info?.('[bpc-runner] Ready.')
   }
 
   const attach = (server) => {
     const logger = server.config.logger
     server.httpServer?.once('listening', () => {
-      start(logger).catch((error) => {
-        logger.error(`[bpc-runner] ${error.message}`)
-      })
+      start(logger)
+        .catch((error) => {
+          logger.error(`[bpc-runner] ${error.message}`)
+        })
+        .finally(() => openBrowserOnce(server))
     })
 
     const shutdown = () => stop()

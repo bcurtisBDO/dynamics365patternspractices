@@ -1,4 +1,4 @@
-import { useEffect, useId, useState } from 'react'
+import { useEffect, useId, useRef, useState } from 'react'
 import { runnerFetch } from './runnerApi.js'
 
 async function fetchJson(url) {
@@ -28,7 +28,11 @@ export default function PathPickerModal({
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
 
+  const loadRequestRef = useRef(0)
+
   const loadDir = async (path) => {
+    loadRequestRef.current += 1
+    const request = loadRequestRef.current
     setLoading(true)
     setError('')
     try {
@@ -40,14 +44,21 @@ export default function PathPickerModal({
         params.set('directories_only', 'true')
       }
       const data = await fetchJson(`/api/fs/list?${params}`)
+      if (request !== loadRequestRef.current) {
+        return
+      }
       setListing(data)
       if (mode === 'folder') {
         setDraft(data.path)
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Could not list folder')
+      if (request === loadRequestRef.current) {
+        setError(err instanceof Error ? err.message : 'Could not list folder')
+      }
     } finally {
-      setLoading(false)
+      if (request === loadRequestRef.current) {
+        setLoading(false)
+      }
     }
   }
 
@@ -140,7 +151,7 @@ export default function PathPickerModal({
           <code className="path-picker-cwd">{listing?.path || '…'}</code>
         </div>
 
-        <div className="path-picker-list" role="listbox" aria-label="Directory contents">
+        <div className="path-picker-list" role="group" aria-label="Directory contents">
           {loading ? <p className="modal-note">Loading…</p> : null}
           {!loading && listing?.entries?.length === 0 ? (
             <p className="modal-note">No matching items in this folder.</p>

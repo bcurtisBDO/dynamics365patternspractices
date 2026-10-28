@@ -12,6 +12,8 @@ from .catalog_validate import MAX_STRING_LENGTH
 from .csv_safe import SafeWriter
 
 PARENT_PREFIX = "Parent not imported: "
+SEVERAL_MATCHES_PREFIX = "Not created: several work items in Azure DevOps already have this Microsoft ID: "
+LOOKUP_FAILED_PREFIX = "Not created: couldn't check Azure DevOps for an existing item with this Microsoft ID: "
 
 CATEGORY_TEXT: dict[str, dict[str, str]] = {
     "area_path": {
@@ -63,7 +65,19 @@ CATEGORY_TEXT: dict[str, dict[str, str]] = {
     },
     "network": {
         "label": "Network error — outcome unknown",
-        "fix": "Check Azure DevOps for a duplicate of these items before re-running Catalog Import.",
+        "fix": "Re-run Catalog Import. Rows already created in Azure DevOps are matched by their "
+        "Microsoft ID and kept, so they aren't created twice; the rest are created then.",
+    },
+    "lookup_failed": {
+        "label": "Couldn't check Azure DevOps for an existing item",
+        "fix": "Re-run Catalog Import; these rows are checked against Azure DevOps by Microsoft ID "
+        "again, then created or matched to the existing item. If this keeps happening, check the "
+        "PAT has Work Items (Read & write) scope and that Azure DevOps is reachable.",
+    },
+    "already_exists": {
+        "label": "Already in Azure DevOps more than once",
+        "fix": "Several work items in the project have this row's Microsoft ID. Delete the extra copies, "
+        "or add the right one to ado-id-map.csv (Key and WorkItemId), then re-run Catalog Import.",
     },
     "parent_failed": {
         "label": "Not imported because its parent failed",
@@ -111,6 +125,22 @@ def explain_failure(
     if text.startswith(PARENT_PREFIX):
         parent = text[len(PARENT_PREFIX):].strip()
         return _result("parent_failed", f"Parent {parent} was not imported.", "", "")
+    if text.startswith(SEVERAL_MATCHES_PREFIX):
+        ids = text[len(SEVERAL_MATCHES_PREFIX):].strip()
+        return _result(
+            "already_exists",
+            f"Work items {ids} already have this Microsoft ID, so the row wasn't created again.",
+            "Microsoft ID",
+            str(fields.get("MSBPC.microsoftid") or ""),
+        )
+    if text.startswith(LOOKUP_FAILED_PREFIX):
+        return _result(
+            "lookup_failed",
+            "Not created: Azure DevOps couldn't be checked for an item that already has this "
+            "Microsoft ID, so the row was held back to avoid a duplicate.",
+            "Microsoft ID",
+            str(fields.get("MSBPC.microsoftid") or ""),
+        )
 
     message = ado_error_message(text)
     status_match = _STATUS_RE.match(text)

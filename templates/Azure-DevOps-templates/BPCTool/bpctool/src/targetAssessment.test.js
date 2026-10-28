@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import {
+  appliedWorkbookFingerprint,
   assessExistingTargets,
+  buildWorkbookApplyRecord,
   buildWorkbookFingerprint,
   gateExistingTargetUpdates,
   validateTargetNames,
@@ -28,6 +30,53 @@ describe('assessExistingTargets', () => {
     expect(assessment.project.exists).toBe(false)
     expect(assessment.project.recommendedAction).toBe('create')
     expect(assessment.workbook.changed).toBe(true)
+  })
+
+  const assessWorkbook = (lastAppliedWorkbook, overrides = {}) =>
+    assessExistingTargets({
+      processName: 'Business Process Catalog',
+      projectName: 'Contoso-BPC',
+      knownProcesses: [{ name: 'Business Process Catalog' }],
+      templatePath: '/BPC Files/2026-Q4/ADO template guideline.xlsx',
+      workbookVersion: '2026-Q4',
+      lastAppliedWorkbook,
+      ...overrides,
+    }).workbook
+
+  it('matches the workbook a live runner run applied', () => {
+    const record = buildWorkbookApplyRecord({
+      templatePath: ' /BPC Files/2026-Q4/ADO template guideline.xlsx ',
+      workbookVersion: '2026-Q4',
+      runnerFingerprint: 'sha256:0123456789abcdef::2026-q4',
+      appliedAt: '2026-10-27T12:00:00.000Z',
+    })
+
+    expect(record).toEqual({
+      fingerprint: '/bpc files/2026-q4/ado template guideline.xlsx::2026-q4',
+      runnerFingerprint: 'sha256:0123456789abcdef::2026-q4',
+      templatePath: '/BPC Files/2026-Q4/ADO template guideline.xlsx',
+      workbookVersion: '2026-Q4',
+      appliedAt: '2026-10-27T12:00:00.000Z',
+    })
+    expect(assessWorkbook(record).changed).toBe(false)
+    expect(assessWorkbook(record, { workbookVersion: '2027-Q1' }).changed).toBe(true)
+  })
+
+  it('compares older records that stored the runner hash by path and version', () => {
+    const legacy = {
+      fingerprint: 'sha256:0123456789abcdef::2026-q4',
+      templatePath: '/BPC Files/2026-Q4/ADO template guideline.xlsx',
+      workbookVersion: '2026-Q4',
+    }
+
+    expect(appliedWorkbookFingerprint(legacy)).toBe(
+      '/bpc files/2026-q4/ado template guideline.xlsx::2026-q4',
+    )
+    expect(assessWorkbook(legacy).changed).toBe(false)
+    expect(appliedWorkbookFingerprint({ fingerprint: 'sha256:0123::x', templatePath: '' })).toBe(
+      'sha256:0123::x',
+    )
+    expect(appliedWorkbookFingerprint(null)).toBeNull()
   })
 })
 

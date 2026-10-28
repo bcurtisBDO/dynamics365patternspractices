@@ -6,7 +6,7 @@ echo === BPCTool ===
 echo Preparing environment (first launch may take a minute)...
 node scripts\ensure-env.mjs
 if errorlevel 1 (
-  echo Setup failed. Ensure Node.js and Python 3 are installed.
+  echo Setup failed. Ensure Node.js 20.19+ or 22.12+ and Python 3.11+ are installed.
   pause
   exit /b 1
 )

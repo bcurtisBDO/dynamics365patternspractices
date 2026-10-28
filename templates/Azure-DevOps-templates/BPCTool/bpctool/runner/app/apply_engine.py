@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from typing import Any, Callable
 
-from .ado_client import AdoClient, AdoError, ReadOnlyAdoClient
+from .ado_client import AdoClient, AdoError, ReadOnlyAdoClient, RunCancelled
 from .excel_ir import build_ir
 from .models import ApplyResult, DryRunRequest
 from .org_url import normalize_ado_org_url
@@ -22,13 +22,18 @@ from .writers import (
     apply_report,
     apply_teams,
 )
+from .writers.process import (
+    SHORTENED_DESCRIPTIONS_FILE,
+    StepSetupError,
+    states_added_by_process,
+    write_shortened_descriptions_csv,
+)
 from .writers.report import write_run_summary
 
 Emit = Callable[[dict[str, Any]], None]
 
-
-class RunCancelled(Exception):
-    """Raised at a safe checkpoint after the user cancels a job."""
+# Steps that need the project to be ready (not still being created) in Azure DevOps.
+_PROJECT_STEPS = {"project", "teams", "backlog", "catalog"}
 
 
 def run_apply(
@@ -86,6 +91,9 @@ def run_apply(
             change_reader = ReadOnlyAdoClient(org_url, pat)
         except ValueError:
             change_reader = None
+    for ado in (client, change_reader):
+        if ado is not None:
+            ado.on_throttle = lambda message: _emit({"type": "info", "message": message})
 
     output_dir = resolve_output_dir(org_url, request.project_name, request.output_root)
     default_folder_name = default_output_dir(org_url, request.project_name, request.output_root).name
@@ -118,6 +126,22 @@ def run_apply(
         )
         return outcome
 
+    def _record_shortened_descriptions(process_stats: dict[str, Any]) -> None:
+        rows = process_stats.get("descriptions_shortened")
+        if not rows:
+            return
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            write_shortened_descriptions_csv(rows, output_dir / SHORTENED_DESCRIPTIONS_FILE)
+        except OSError as exc:
+            _emit(
+                {
+                    "type": "step-progress",
+                    "stepId": "process",
+                    "message": f"WARNING: could not write {SHORTENED_DESCRIPTIONS_FILE}: {exc}",
+                }
+            )
+
     process_exists = request.known_process_exists
     project_exists = request.known_project_exists
     # (target, list the browser sent: None = not loaded, False = loaded without it)
@@ -126,7 +150,41 @@ def run_apply(
         # The browser's inventory is optional and can be stale; policy gates use what ADO reports.
         try:
             process_exists = client.get_process_id(request.process_name) is not None
-            project_exists = client.get_project_id(request.project_name) is not None
+            if _PROJECT_STEPS.intersection(step_filter or STEP_ORDER):
+                project_exists = (
+                    client.get_ready_project_id(
+                        request.project_name,
+                        should_cancel=cancel_requested,
+                        on_wait=lambda state: _emit(
+                            {
+                                "type": "info",
+                                "message": (
+                                    f"Project '{request.project_name}' is still being set up in Azure "
+                                    f"DevOps (state: {state}); waiting until it's ready before starting…"
+                                ),
+                            }
+                        ),
+                    )
+                    is not None
+                )
+            else:
+                project_exists = client.get_project_id(request.project_name) is not None
+        except RunCancelled as exc:
+            _emit({"type": "job-cancelled", "message": str(exc), "durationMs": 0})
+            return ApplyResult(
+                ok=False,
+                dry_run=dry_run,
+                plan=None,
+                step_results={},
+                output_dir=str(output_dir),
+                error=str(exc),
+                cancelled=True,
+                events=events,
+                duration_ms=0,
+                timings=[],
+                run_id=run_id,
+                outcome=_write_summary(None, True),
+            )
         except AdoError as exc:
             error = f"Could not check the process and project in Azure DevOps before the run: {exc}"
             _emit({"type": "job-error", "message": error, "durationMs": 0})
@@ -206,6 +264,11 @@ def run_apply(
         None,
         "skip",
     }
+    process_runs = "process" in selected and (planned.get("process") or {}).get("planned_action") not in {
+        None,
+        "skip",
+    }
+    planned_states = states_added_by_process(ir) if process_runs else {}
 
     _emit({"type": "apply-started", "message": f"Starting {'dry-run apply' if dry_run else 'apply'}"})
     template_notice = project_name_notice(
@@ -278,66 +341,84 @@ def run_apply(
             )
             step_started = time.perf_counter()
 
-            if step_id == "process":
-                result = apply_process(client, ir, dry_run=dry_run, emit=step_emit)
-                process_id = result.get("process_id")
-                if not dry_run and client and not process_id:
-                    process_id = client.get_process_id(request.process_name)
-            elif step_id == "layout":
-                result = apply_layout(
-                    client, ir, dry_run=dry_run, emit=step_emit, process_id=process_id
-                )
-            elif step_id == "project":
-                result = apply_project(
-                    client, ir, dry_run=dry_run, emit=step_emit, process_id=process_id
-                )
-            elif step_id == "teams":
-                root = request.root_area_path or request.project_name
-                result = apply_teams(
-                    client, ir, dry_run=dry_run, emit=step_emit, root_area_path=root
-                )
-            elif step_id == "backlog":
-                result = apply_backlog(
-                    client,
-                    ir,
-                    dry_run=dry_run,
-                    emit=step_emit,
-                    process_id=process_id,
-                    workers=int(getattr(request, "catalog_parallel_workers", 4) or 4),
-                    process_changes=(planned.get("process") or {}).get("planned_action") != "skip",
-                )
-            elif step_id == "catalog":
-                result = apply_catalog(
-                    client,
-                    ir,
-                    dry_run=dry_run,
-                    emit=step_emit,
-                    output_dir=output_dir,
-                    limit=catalog_limit,
-                    convert_markdown_to_html=bool(request.convert_markdown_to_html),
-                    include_deprecated_deleted=bool(request.include_deprecated_deleted),
-                    parallel_workers=int(
-                        getattr(request, "catalog_parallel_workers", 4) or 4
-                    ),
-                    progress=catalog_progress,
-                    should_cancel=cancel_requested,
-                    run_id=run_id,
-                    area_root=request.root_area_path or request.project_name,
-                    change_reader=change_reader,
-                )
-            elif step_id == "report":
-                result = apply_report(
-                    ir,
-                    step_results=step_results,
-                    output_dir=output_dir,
-                    org_url=org_url,
-                    emit=step_emit,
-                    dry_run=dry_run,
-                    run_id=run_id,
-                    run_started=run_started_wall,
-                )
-            else:
-                result = {"skipped": True, "reason": f"Unknown step {step_id}"}
+            try:
+                if step_id == "process":
+                    result = apply_process(client, ir, dry_run=dry_run, emit=step_emit)
+                    _record_shortened_descriptions(result)
+                    process_id = result.get("process_id")
+                    if not dry_run and client and not process_id:
+                        process_id = client.get_process_id(request.process_name)
+                elif step_id == "layout":
+                    result = apply_layout(
+                        client, ir, dry_run=dry_run, emit=step_emit, process_id=process_id
+                    )
+                elif step_id == "project":
+                    result = apply_project(
+                        client,
+                        ir,
+                        dry_run=dry_run,
+                        emit=step_emit,
+                        process_id=process_id,
+                        should_cancel=cancel_requested,
+                    )
+                elif step_id == "teams":
+                    root = request.root_area_path or request.project_name
+                    result = apply_teams(
+                        client, ir, dry_run=dry_run, emit=step_emit, root_area_path=root
+                    )
+                elif step_id == "backlog":
+                    result = apply_backlog(
+                        client,
+                        ir,
+                        dry_run=dry_run,
+                        emit=step_emit,
+                        process_id=process_id,
+                        workers=int(getattr(request, "catalog_parallel_workers", 4) or 4),
+                        process_changes=(planned.get("process") or {}).get("planned_action") != "skip",
+                    )
+                elif step_id == "catalog":
+                    result = apply_catalog(
+                        client,
+                        ir,
+                        dry_run=dry_run,
+                        emit=step_emit,
+                        output_dir=output_dir,
+                        limit=catalog_limit,
+                        convert_markdown_to_html=bool(request.convert_markdown_to_html),
+                        include_deprecated_deleted=bool(request.include_deprecated_deleted),
+                        parallel_workers=int(
+                            getattr(request, "catalog_parallel_workers", 4) or 4
+                        ),
+                        progress=catalog_progress,
+                        should_cancel=cancel_requested,
+                        run_id=run_id,
+                        area_root=request.root_area_path or request.project_name,
+                        change_reader=change_reader,
+                        planned_states=planned_states,
+                    )
+                elif step_id == "report":
+                    result = apply_report(
+                        ir,
+                        step_results=step_results,
+                        output_dir=output_dir,
+                        org_url=org_url,
+                        emit=step_emit,
+                        dry_run=dry_run,
+                        run_id=run_id,
+                        run_started=run_started_wall,
+                    )
+                else:
+                    result = {"skipped": True, "reason": f"Unknown step {step_id}"}
+            except StepSetupError as exc:
+                # The step did everything else first; keep its counts for the report.
+                if step_id == "process":
+                    _record_shortened_descriptions(exc.stats)
+                step_results[step_id] = {
+                    **exc.stats,
+                    "error": str(exc),
+                    "duration_ms": int((time.perf_counter() - step_started) * 1000),
+                }
+                raise
 
             duration_ms = int((time.perf_counter() - step_started) * 1000)
             if isinstance(result, dict):

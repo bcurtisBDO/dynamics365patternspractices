@@ -104,6 +104,20 @@ export function migrateCompletedStepIds(completedStepIds = []) {
   return Array.from(next)
 }
 
+/**
+ * Where completed steps for a run target are kept. Only Runner mode changes Azure DevOps, so
+ * only its live runs reach the persisted cache that later runs skip completed steps from;
+ * Simulate and API runs get an in-memory bucket per mode.
+ */
+export function completionScope(executionMode, cacheKey) {
+  if (!cacheKey) {
+    return null
+  }
+  return executionMode === 'runner'
+    ? { key: cacheKey, persisted: true }
+    : { key: `${executionMode}::${cacheKey}`, persisted: false }
+}
+
 const sleep = (ms, signal) =>
   new Promise((resolve, reject) => {
     if (signal?.aborted) {

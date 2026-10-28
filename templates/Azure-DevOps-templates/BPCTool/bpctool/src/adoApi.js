@@ -57,6 +57,11 @@ export function stepsRequireMultivalueExtension(stepIds = []) {
   return stepIds.some((id) => need.has(id))
 }
 
+/** Whether the run gate must ask Azure DevOps again (no settled result for this connection). */
+export function multivalueStatusNeedsCheck(status) {
+  return !['installed', 'disabled', 'missing'].includes(status)
+}
+
 const sleep = (ms, signal) =>
   new Promise((resolve, reject) => {
     if (signal?.aborted) {

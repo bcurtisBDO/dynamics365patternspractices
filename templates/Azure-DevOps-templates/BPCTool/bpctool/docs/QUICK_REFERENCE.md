@@ -75,7 +75,9 @@ Steps: **1** Process Template → **2** Page Layout Setup → **3** Project Crea
 | `import-failures.csv` | Rows that failed — **Fix this row** vs **Blocked by parent**, with how to fix |
 | `import-prevalidate.csv` | Values changed or removed before import |
 | `import-changes.csv` | Rehearsal: what differs between the workbook and the existing project |
-| `ado-id-map.csv` | **Keep.** Lets a re-run skip items already created — losing it means duplicates |
+| `ado-id-map.csv` | **Keep.** Lets a re-run skip items already created. Rows not in it are looked up by Microsoft ID before they're created |
+| `pending-state-updates.csv` | **Keep.** Items created in their type's first state (e.g. Test Case Design) and then moved to their State; any not marked `done` are set by the next Catalog Import |
+| `matched-by-microsoft-id.csv` | Rows with a new key (e.g. renumbered by a new release) that reused an existing item instead of creating another |
 | `bpctool-target.json` | Which org + project the folder belongs to |
 
 - Another project whose name gives the same folder name gets `<org>_<project>-<code>`.
@@ -90,13 +92,14 @@ Steps: **1** Process Template → **2** Page Layout Setup → **3** Project Crea
 | *Port 8787 is in use by another program* | Close that program, then relaunch |
 | 401 / 403 / *sign-in page (HTTP 203)* | PAT expired, wrong org, or missing scopes (table above) |
 | *Process step: … could not be created* | Usually PAT scopes or process permissions; fix, then re-run Process Template |
+| *…description was shortened…* warning | A field description over 255 characters (or one Azure DevOps rejected) was cut to fit; full text in `descriptions-shortened.csv`. Shorten it in the workbook to choose the wording |
 | *Confirm update* / *Plan blocked* | **Fetch existing processes / projects**, tick the confirm boxes, or change the policy |
 | *A run is already in progress* | Another tab is running the same project (or one with the same results folder name) — wait or cancel it |
 | *ado-id-map.csv … lists work items from project …* / *… exist in Azure DevOps any more* | Move `ado-id-map.csv` out of the results folder (keep a copy) or choose another Run output folder |
 | Catalog folder: 0 rows | Point at the release folder (e.g. `2026-Q4`), not the `BPC Files` root; use absolute paths |
 | Multi-select values fail | Install Multivalue, re-run Process Template then Page Layout, then Catalog Import |
 | Items without parents | `import-failures.csv` (*Blocked by parent*), `backfill-links-report.csv`; re-run Catalog Import to resume |
-| 429 / 503 throttling | Lower **Catalog workers** and re-run Catalog Import — it resumes |
+| 429 / 503 throttling, or a "requests are being delayed" email | The runner already slows all workers when Azure DevOps asks. If it keeps happening, lower **Catalog workers** to 2 and re-run Catalog Import — it resumes |
 | Completion marks look wrong | **Clear completion cache** |
 | Path picker returned only a name | Use **Browse…** or paste a full absolute path |
 

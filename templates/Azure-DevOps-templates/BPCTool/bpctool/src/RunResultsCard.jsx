@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { memo, useState } from 'react'
 import { outputFileUrl } from './runnerApi'
 
 const STATUS_ICON = {
@@ -27,8 +27,8 @@ function AttentionItem({ item, folder, root = '' }) {
       ) : null}
       {item.examples?.length ? (
         <ul className="attention-examples">
-          {item.examples.map((example) => (
-            <li key={example}>{example}</li>
+          {item.examples.map((example, index) => (
+            <li key={`${index}:${example}`}>{example}</li>
           ))}
         </ul>
       ) : null}
@@ -42,7 +42,7 @@ function AttentionItem({ item, folder, root = '' }) {
 }
 
 /** Catalog data checks (needs review / fixed automatically) from Preview plan or a run. */
-export function DataChecks({ checks }) {
+export const DataChecks = memo(function DataChecks({ checks }) {
   if (!checks) {
     return null
   }
@@ -100,7 +100,7 @@ export function DataChecks({ checks }) {
       </p>
     </div>
   )
-}
+})
 
 /** Rehearsal only: differences between the workbook and items an earlier import created. */
 function ChangesSection({ changes }) {
@@ -113,8 +113,8 @@ function ChangesSection({ changes }) {
       <p>{changes.summary}</p>
       {changes.items?.length ? (
         <ul>
-          {changes.items.map((item) => (
-            <li key={item}>{item}</li>
+          {changes.items.map((item, index) => (
+            <li key={`${index}:${item}`}>{item}</li>
           ))}
         </ul>
       ) : null}
@@ -132,8 +132,8 @@ function ChangesSection({ changes }) {
               </p>
               {field.examples?.length ? (
                 <ul className="attention-examples">
-                  {field.examples.map((example) => (
-                    <li key={example}>{example}</li>
+                  {field.examples.map((example, index) => (
+                    <li key={`${index}:${example}`}>{example}</li>
                   ))}
                 </ul>
               ) : null}
@@ -151,7 +151,7 @@ function ChangesSection({ changes }) {
   )
 }
 
-export default function RunResultsCard({ outcome, onRerunCatalog, onDismiss }) {
+function RunResultsCard({ outcome, onRerunCatalog, onDismiss }) {
   const [showAll, setShowAll] = useState(false)
   if (!outcome) {
     return null
@@ -178,8 +178,8 @@ export default function RunResultsCard({ outcome, onRerunCatalog, onDismiss }) {
         ) : null}
       </header>
 
-      {(outcome.notices || []).map((notice) => (
-        <p key={notice} className="run-notice">
+      {(outcome.notices || []).map((notice, index) => (
+        <p key={`${index}:${notice}`} className="run-notice">
           {notice}
         </p>
       ))}
@@ -208,12 +208,31 @@ export default function RunResultsCard({ outcome, onRerunCatalog, onDismiss }) {
         </div>
       ) : null}
 
+      {outcome.adoLinks?.length ? (
+        <p className="run-results-ado-links">
+          <strong>Open in Azure DevOps:</strong>
+          {outcome.adoLinks.map((link) => (
+            <a key={link.label} href={link.url} target="_blank" rel="noreferrer">
+              {link.label}
+            </a>
+          ))}
+          {outcome.dryRun ? (
+            <em>A rehearsal creates nothing, so these open only once the project and process exist.</em>
+          ) : null}
+        </p>
+      ) : null}
+
       {attention.length ? (
         <>
           <h3>What needs attention</h3>
           <ol className="attention-list">
-            {visible.map((item) => (
-              <AttentionItem key={item.title} item={item} folder={folder} root={outcome.outputRoot} />
+            {visible.map((item, index) => (
+              <AttentionItem
+                key={`${index}:${item.title}`}
+                item={item}
+                folder={folder}
+                root={outcome.outputRoot}
+              />
             ))}
           </ol>
           {attention.length > ATTENTION_PREVIEW ? (
@@ -264,3 +283,5 @@ export default function RunResultsCard({ outcome, onRerunCatalog, onDismiss }) {
     </section>
   )
 }
+
+export default memo(RunResultsCard)

@@ -5,7 +5,10 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
+from .failure_explain import CATEGORY_TEXT
+from .org_url import parse_ado_org_url
 from .timing import format_duration_ms
 
 STEP_TITLES = {
@@ -41,9 +44,23 @@ OUTPUT_FILES: dict[str, tuple[str, str]] = {
         "Skipped rows (deprecated / deleted)",
         "Catalog rows not imported because their Catalog status, or a parent row's, is Deprecated or Deleted. Opens in Excel.",
     ),
+    "matched-by-microsoft-id.csv": (
+        "Rows matched to existing items",
+        "Rows with a new key that were already in Azure DevOps (same Microsoft ID): the item was reused "
+        "instead of created again. Opens in Excel.",
+    ),
+    "descriptions-shortened.csv": (
+        "Shortened descriptions",
+        "Field and work item type descriptions the Process step shortened or left empty, with the full workbook text. Opens in Excel.",
+    ),
     "ado-id-map.csv": (
         "Imported items",
         "Catalog key → Azure DevOps work item ID. Used to resume; keep this file.",
+    ),
+    "pending-state-updates.csv": (
+        "State updates",
+        "Items created in their type's first state and then moved to the workbook's State. Rows not "
+        "marked done are tried again by the next Catalog Import; keep this file.",
     ),
     "import-preview.csv": ("Catalog sample", "First 50 catalog rows as they will be sent."),
     f"{LIVE_SUMMARY_NAME}.json": ("Run report (JSON)", "Machine-readable version of the report."),
@@ -56,6 +73,30 @@ REHEARSAL_ONLY_FILES = ("import-changes.",)
 
 
 PROJECT_PLACEHOLDER_TEXT = "Your Project Name Here"
+
+
+def ado_links(org_url: str, *, project_name: str, process_name: str) -> list[dict[str, str]]:
+    """Azure DevOps web pages for the run's project and process (empty when the org URL is invalid)."""
+    parsed = parse_ado_org_url(org_url)
+    if not parsed.ok:
+        return []
+    org = parsed.organization_url
+    links = []
+    if project_name:
+        project = f"{org}/{quote(project_name, safe='')}"
+        links += [
+            {"label": "Project", "url": project},
+            {"label": "Boards", "url": f"{project}/_boards/board"},
+            {"label": "Work items", "url": f"{project}/_workitems"},
+        ]
+    if process_name:
+        links.append(
+            {
+                "label": "Process settings",
+                "url": f"{org}/_settings/process?process-name={quote(process_name, safe='')}",
+            }
+        )
+    return links
 
 
 def catalog_placeholder_count(prevalidate: dict[str, Any] | None) -> int:
@@ -100,6 +141,11 @@ def describe_step(step_id: str, result: dict[str, Any], *, dry_run: bool) -> tup
         return "skipped", result.get("reason") or "Skipped by plan or policy."
     if dry_run:
         return "rehearsed", "Rehearsed — no changes made."
+    if result.get("error"):
+        _status, text = describe_step(
+            step_id, {k: v for k, v in result.items() if k != "error"}, dry_run=False
+        )
+        return "error", f"{text} Then the step failed — see the error at the top."
     if step_id == "process":
         text = (
             f"{_plural(result.get('wits_created'), 'work item type')} created, "
@@ -107,6 +153,12 @@ def describe_step(step_id: str, result: dict[str, Any], *, dry_run: bool) -> tup
             f"{_plural(result.get('fields_created'), 'field')} created"
             + (f" ({n(result.get('fields_existing'))} already existed)" if result.get("fields_existing") else "")
             + f"; {_plural(result.get('picklists'), 'picklist')}."
+            + (
+                f" {_plural(len(shortened), 'description')} shortened or left empty — full text in "
+                "descriptions-shortened.csv."
+                if (shortened := result.get("descriptions_shortened"))
+                else ""
+            )
             + _warning_note(result)
         )
         return ("warning" if result.get("warnings") else "ok"), text
@@ -148,6 +200,16 @@ def describe_step(step_id: str, result: dict[str, Any], *, dry_run: bool) -> tup
         text = f"{n(done)} of {n(drafts)} catalog items in Azure DevOps"
         if result.get("skipped"):
             text += f" ({n(result.get('created'))} new this run, {n(result.get('skipped'))} from earlier runs)"
+        if result.get("matched_existing"):
+            text += (
+                f"; {_plural(result['matched_existing'], 'row')} with a new key matched an existing item by "
+                "Microsoft ID and reused it (matched-by-microsoft-id.csv)"
+            )
+        if result.get("state_set_after_create"):
+            text += (
+                f"; {_plural(result['state_set_after_create'], 'item')} created in the type's first "
+                "state, then moved to its State"
+            )
         if failed:
             roots = summary.get("rootCauses", failed - int(result.get("missing_parent") or 0))
             blocked = summary.get("blockedByParent", result.get("missing_parent"))
@@ -198,13 +260,25 @@ def _example_text(example: dict[str, Any]) -> str:
 
 
 CHANGE_KIND_TEXT = {
-    "exists_not_in_id_map": (
-        "row is already in Azure DevOps but not in ado-id-map.csv — a live run would create it again",
-        "rows are already in Azure DevOps but not in ado-id-map.csv — a live run would create them again",
-    ),
     "ambiguous_match": (
-        "row matches several work items in Azure DevOps (same Microsoft ID)",
-        "rows match several work items in Azure DevOps (same Microsoft ID)",
+        "row matches several work items in Azure DevOps (same Microsoft ID) — a live run doesn't create it",
+        "rows match several work items in Azure DevOps (same Microsoft ID) — a live run doesn't create them",
+    ),
+    "blocked_by_ambiguous_parent": (
+        "row is under a row that matches several work items — a live run doesn't create it",
+        "rows are under a row that matches several work items — a live run doesn't create them",
+    ),
+    "exists_not_in_id_map": (
+        "row is already in Azure DevOps but not in ado-id-map.csv — a live run reuses it",
+        "rows are already in Azure DevOps but not in ado-id-map.csv — a live run reuses them",
+    ),
+    "matched_other_key": (
+        "row has a new key but is already in Azure DevOps (same Microsoft ID) — a live run reuses it",
+        "rows have a new key but are already in Azure DevOps (same Microsoft ID) — a live run reuses them",
+    ),
+    "key_reassigned": (
+        "key now has another Microsoft ID — its earlier item goes to the matching row and a live run creates this row",
+        "keys now have another Microsoft ID — their earlier items go to the matching rows and a live run creates these rows",
     ),
     "parent_changed": ("item has a different parent", "items have a different parent"),
     "type_changed": ("item has a different work item type", "items have a different work item type"),
@@ -287,9 +361,10 @@ def describe_changes(raw: dict[str, Any] | None) -> dict[str, Any] | None:
         "note": (
             "A live run does not apply these changes: Catalog Import only creates new items. "
             + (
-                "Without ado-id-map.csv it can't tell which rows already exist, so it creates every row."
+                "Rows already in Azure DevOps are matched by Microsoft ID and added to ado-id-map.csv "
+                "instead of being created again."
                 if raw.get("matchedBy") == "microsoft_id"
-                else "It skips the items it imported before."
+                else "It skips the items it imported before, and reuses existing items for rows whose key changed."
             )
         ),
         "file": "import-changes.csv",
@@ -351,16 +426,41 @@ def build_outcome(
                 "count": group["count"] + blocked,
             }
         )
-    if int(catalog.get("outcome_unknown") or 0):
+    failure_groups = {g.get("category") for g in (catalog.get("failure_summary") or {}).get("groups") or []}
+    # The "network" failure group already lists these rows with the same fix.
+    if int(catalog.get("outcome_unknown") or 0) and "network" not in failure_groups:
         attention.append(
             {
                 "severity": "error",
                 "title": f"{_plural(catalog['outcome_unknown'], 'create')} had a network error with unknown outcome",
                 "detail": "Azure DevOps may or may not have created these items.",
-                "fix": "Search Azure DevOps for duplicates of these rows before re-running Catalog Import.",
+                "fix": CATEGORY_TEXT["network"]["fix"],
                 "examples": [],
                 "file": "import-failures.csv",
                 "count": int(catalog["outcome_unknown"]),
+            }
+        )
+    state_not_set = int(catalog.get("state_not_set") or 0)
+    if state_not_set:
+        attention.append(
+            {
+                "severity": "warning",
+                "title": f"{_plural(state_not_set, 'item')} created but not moved to {'its' if state_not_set == 1 else 'their'} State{catalog_note}",
+                "detail": (
+                    "Azure DevOps accepts only a type's first state when creating, so these items were created "
+                    "in it, but moving them to the workbook's State afterwards failed."
+                ),
+                "fix": (
+                    "Re-run Catalog Import: it tries these items again. If they still fail, check that the "
+                    "type allows that state, or set the State in Azure DevOps."
+                ),
+                "examples": [
+                    f"{ex.get('sourceFile')} row {ex.get('sourceRow')} ({ex.get('key')}, work item "
+                    f"{ex.get('workItemId')}) — State '{ex.get('state')}': {ex.get('error')}"
+                    for ex in (catalog.get("state_not_set_examples") or [])[:3]
+                ],
+                "file": "pending-state-updates.csv",
+                "count": state_not_set,
             }
         )
     prevalidate = catalog.get("prevalidate") or {}
@@ -390,24 +490,53 @@ def build_outcome(
                 }
             )
     raw_changes = catalog.get("changes") if dry_run and "catalog" not in earlier else None
-    duplicates = int(((raw_changes or {}).get("byKind") or {}).get("exists_not_in_id_map") or 0)
+    change_kinds = (raw_changes or {}).get("byKind") or {}
+    duplicates = int(change_kinds.get("exists_not_in_id_map") or 0)
     if duplicates:
         attention.append(
             {
-                "severity": "warning",
-                "title": f"{_plural(duplicates, 'row')} already in Azure DevOps would be created again",
+                "severity": "info",
+                "title": f"{_plural(duplicates, 'row')} already in Azure DevOps but not in ado-id-map.csv",
                 "detail": (
                     "These workbook rows match existing work items by Microsoft ID, but this output folder "
-                    "has no ado-id-map.csv, so a live Catalog Import would create duplicates."
+                    "has no ado-id-map.csv. A live Catalog Import reuses those items instead of creating them again."
                 ),
                 "fix": (
-                    "Before the live run, choose the Run output folder that holds the ado-id-map.csv from the "
-                    "earlier import (or copy that file into this one). If the items were created some other "
-                    "way, don't run Catalog Import into this project."
+                    "If an earlier import wrote its ado-id-map.csv to another Run output folder, choose that "
+                    "folder. If the items were created some other way, check they are the ones you want "
+                    "Catalog Import to use."
                 ),
                 "examples": [],
                 "file": "import-changes.csv",
                 "count": duplicates,
+            }
+        )
+    several = int(change_kinds.get("ambiguous_match") or 0)
+    blocked_below = int(change_kinds.get("blocked_by_ambiguous_parent") or 0)
+    if several:
+        attention.append(
+            {
+                "severity": "warning",
+                "title": f"{_plural(several, 'row')} {'matches' if several == 1 else 'match'} "
+                "several work items in Azure DevOps",
+                "detail": (
+                    "More than one existing work item has the row's Microsoft ID, so a live run won't create "
+                    "the row (that would add another copy) and reports it as failed."
+                    + (
+                        f" {_plural(blocked_below, 'row')} under {'it' if several == 1 else 'them'} "
+                        f"{'waits' if blocked_below == 1 else 'wait'} too and "
+                        f"{'is' if blocked_below == 1 else 'are'} not created either."
+                        if blocked_below
+                        else ""
+                    )
+                ),
+                "fix": (
+                    "Delete the extra copies in Azure DevOps, or add the right work item to ado-id-map.csv "
+                    "(Key and WorkItemId), then run Catalog Import."
+                ),
+                "examples": [],
+                "file": "import-changes.csv",
+                "count": several + blocked_below,
             }
         )
     severity_rank = {"error": 0, "warning": 1, "info": 2}
@@ -461,8 +590,16 @@ def build_outcome(
             parts.append(f"A live run would import {n(remaining)} of {n(drafts)} catalog items.")
         if review_total:
             parts.append(f"{_plural(review_total, 'value')} need review before the live run.")
-        if duplicates:
-            parts.append(f"{_plural(duplicates, 'row')} would be created again — see What needs attention.")
+        reused = duplicates + int(change_kinds.get("matched_other_key") or 0)
+        if reused:
+            parts.append(
+                f"{_plural(reused, 'row')} already in Azure DevOps would be reused, not created again."
+            )
+        if several:
+            parts.append(
+                f"{_plural(several, 'row')} {'matches' if several == 1 else 'match'} several work items "
+                "— see What needs attention."
+            )
         if changes and changes.get("itemsChanged"):
             parts.append(
                 f"{_plural(changes['itemsChanged'], 'item')} already in Azure DevOps "

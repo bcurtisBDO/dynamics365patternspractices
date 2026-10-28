@@ -1,6 +1,6 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
-import { localRunnerPlugin } from './scripts/localRunnerPlugin.js'
+import { localRunnerPlugin, quietRunnerUnavailable } from './scripts/localRunnerPlugin.js'
 
 const adoProxy = {
   '/ado-proxy': {
@@ -20,6 +20,7 @@ const adoProxy = {
     target: 'http://127.0.0.1:8787',
     changeOrigin: true,
     rewrite: (path) => path.replace(/^\/api/, ''),
+    configure: quietRunnerUnavailable,
   },
 }
 
@@ -27,7 +28,8 @@ const adoProxy = {
 export default defineConfig({
   plugins: [react(), localRunnerPlugin()],
   server: {
-    open: true,
+    // The runner plugin opens the browser once the runner is ready.
+    open: false,
     proxy: adoProxy,
   },
   preview: {

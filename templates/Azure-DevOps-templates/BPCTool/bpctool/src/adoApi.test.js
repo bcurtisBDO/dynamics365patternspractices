@@ -7,6 +7,7 @@ import {
   getMultivalueExtensionStatus,
   installMultivalueExtension,
   maskSecret,
+  multivalueStatusNeedsCheck,
   stepsRequireMultivalueExtension,
 } from './adoApi'
 
@@ -39,6 +40,15 @@ describe('adoApi helpers', () => {
     expect(stepsRequireMultivalueExtension(['catalog'])).toBe(false)
     expect(stepsRequireMultivalueExtension(['process', 'catalog'])).toBe(true)
     expect(stepsRequireMultivalueExtension(['layout'])).toBe(true)
+  })
+
+  it('re-checks the Multivalue extension unless this connection has a settled result', () => {
+    for (const status of ['unknown', 'checking', 'error', undefined]) {
+      expect(multivalueStatusNeedsCheck(status)).toBe(true)
+    }
+    for (const status of ['installed', 'disabled', 'missing']) {
+      expect(multivalueStatusNeedsCheck(status)).toBe(false)
+    }
   })
 
   it('fetchProjects maps ADO payload', async () => {

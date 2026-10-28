@@ -40,37 +40,47 @@ export default function ConnectionPanel({
             : extensionStatus === 'error'
               ? { className: 'idle', label: 'Multivalue: check failed' }
               : { className: 'idle', label: 'Multivalue: not checked' }
-  const [expandedWhileReady, setExpandedWhileReady] = useState(false)
-  const open = !connectionReady || expandedWhileReady
+  // null = automatic: open until existing targets load (Simulate loads none), then collapsed.
+  // Working inside the panel pins it open so it never collapses under the cursor.
+  const [userOpen, setUserOpen] = useState(null)
+  const validated =
+    connectionReady && (executionMode === 'simulate' || projectsFetched || processesFetched)
+  const open = !connectionReady || (userOpen ?? !validated)
 
   return (
     <section className="panel collapsible-panel">
-      <button
-        type="button"
-        className="panel-heading-row collapsible-trigger"
-        onClick={() => {
-          if (!connectionReady) {
-            return
-          }
-          setExpandedWhileReady((value) => !value)
-        }}
-        aria-expanded={open}
-      >
-        <h2>1. Connection</h2>
-        <span className="collapse-meta">
-          <span
-            className={`status-chip connection-pill ${connectionReady ? 'completed' : 'idle'}`}
-          >
-            {connectionReady ? 'Ready' : 'Needs URL + PAT'}
+      <h2 className="collapsible-heading">
+        <button
+          type="button"
+          className="panel-heading-row collapsible-trigger"
+          onClick={() => {
+            if (!connectionReady) {
+              return
+            }
+            setUserOpen(!open)
+          }}
+          aria-expanded={open}
+        >
+          <span className="collapsible-title">1. Connection</span>
+          <span className="collapse-meta">
+            <span
+              className={`status-chip connection-pill ${connectionReady ? 'completed' : 'idle'}`}
+            >
+              {connectionReady ? 'Ready' : 'Needs URL + PAT'}
+            </span>
+            <span className="collapse-caret" aria-hidden="true">
+              {open ? '▾' : '▸'}
+            </span>
           </span>
-          <span className="collapse-caret" aria-hidden="true">
-            {open ? '▾' : '▸'}
-          </span>
-        </span>
-      </button>
+        </button>
+      </h2>
 
       {open ? (
-        <div className="grid-2 collapsible-body">
+        <div
+          className="grid-2 collapsible-body"
+          onFocus={() => setUserOpen(true)}
+          onChange={() => setUserOpen(true)}
+        >
           <label className="field-span-full">
             Azure DevOps org URL
             <input

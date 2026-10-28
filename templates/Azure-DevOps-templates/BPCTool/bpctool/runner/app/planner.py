@@ -6,6 +6,11 @@ from pathlib import Path
 from typing import Any
 
 from .models import ENGINE_STEPS, DryRunResponse, PlanAction
+from .writers.process import (
+    FIELD_DESCRIPTION_MAX,
+    SHORTENED_DESCRIPTIONS_FILE,
+    long_field_descriptions,
+)
 
 STEP_ORDER = list(ENGINE_STEPS)
 # Backlog renames / creates / deletes the process's backlog levels and moves work item
@@ -307,6 +312,17 @@ def build_dry_run_plan(
     else:
         warnings.append(
             "Catalog source directory missing or empty — add the current release's catalog workbooks to include import actions."
+        )
+    long_descriptions = long_field_descriptions(ir)
+    if long_descriptions and process_action != "skip" and "process" in selected:
+        listed = ", ".join(f"{ref} ({length})" for ref, length in long_descriptions[:5])
+        more = f" and {len(long_descriptions) - 5} more" if len(long_descriptions) > 5 else ""
+        warnings.append(
+            f"{len(long_descriptions)} field description(s) on the Fields sheet are longer than "
+            f"Azure DevOps' {FIELD_DESCRIPTION_MAX}-character limit: {listed}{more}. The Process step "
+            f"shortens them when it creates the field (full text in {SHORTENED_DESCRIPTIONS_FILE}); "
+            "fields that already exist are left as they are. Shorten them in the workbook to choose "
+            "the wording."
         )
     warnings.extend(ir["catalog"].get("warnings", []))
     release_warning = _release_mismatch_warning(

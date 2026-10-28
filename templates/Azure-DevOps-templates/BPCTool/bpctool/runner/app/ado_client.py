@@ -8,6 +8,7 @@ import json
 import random
 import threading
 import time
+from collections.abc import Callable, Mapping
 from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib.parse import quote, unquote, urlencode, urlsplit
@@ -26,6 +27,31 @@ _REJECTED_STATUSES = {429, 503}
 # Additional statuses retried only for idempotent calls (request may have run).
 _IDEMPOTENT_RETRY_STATUSES = {500, 502, 504}
 
+# Azure DevOps rate-limit headers (sent on 200 responses too, before delays start).
+_RATE_HEADERS = (
+    "Retry-After",
+    "X-RateLimit-Resource",
+    "X-RateLimit-Delay",
+    "X-RateLimit-Limit",
+    "X-RateLimit-Remaining",
+)
+# Spacing between requests (all threads) when few TSTUs remain: (remaining share, seconds).
+_PACING_STEPS = ((0.10, 2.0), (0.25, 0.5))
+_DELAYED_SPACING_S = 2.0
+_PACING_HOLD_S = 30.0
+_NOTICE_QUIET_S = 60.0
+
+# Project creation runs as an async operation in Azure DevOps.
+PROJECT_POLL_INTERVAL_S = 2.0
+PROJECT_CREATE_TIMEOUT_S = 300.0
+# How long a project may be missing by name before it is treated as not created.
+PROJECT_MISSING_GRACE_S = 10.0
+_OPERATION_DONE = {"succeeded", "failed", "cancelled"}
+
+
+def _poll_count(window_s: float) -> int:
+    return max(1, round(window_s / max(PROJECT_POLL_INTERVAL_S, 0.1)) + 1)
+
 
 class AdoError(RuntimeError):
     def __init__(
@@ -40,6 +66,10 @@ class AdoError(RuntimeError):
         self.status = status
         self.transient = transient
         self.outcome_unknown = outcome_unknown
+
+
+class RunCancelled(Exception):
+    """Raised at a safe checkpoint after the user cancels a job."""
 
 
 def _proxy_for(scheme: str, host: str) -> Any:
@@ -132,8 +162,144 @@ def retry_delay_seconds(retry_after: str | None, attempt: int) -> float:
     return base * (0.75 + random.random() * 0.5)
 
 
+def _header_float(headers: Mapping[str, str], name: str) -> float | None:
+    value = headers.get(name)
+    if value is None:
+        return None
+    try:
+        return float(str(value).strip())
+    except ValueError:
+        return None
+
+
+class _ThrottleGate:
+    """Pauses and spaces requests from every worker thread that shares one client.
+
+    Azure DevOps delays (rather than rejects) requests once a user's usage passes
+    its limit, and warns ahead of that with ``X-RateLimit-Remaining`` and
+    ``Retry-After`` on successful responses.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._not_before = 0.0
+        self._next_slot = 0.0
+        self._spacing = 0.0
+        self._spacing_until = 0.0
+        self._last_notice = float("-inf")
+
+    def wait(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            start = max(now, self._not_before)
+            if now < self._spacing_until:
+                start = max(start, self._next_slot)
+                self._next_slot = start + self._spacing
+        if start > now:
+            time.sleep(start - now)
+
+    def pause(self, seconds: float) -> None:
+        if seconds <= 0:
+            return
+        with self._lock:
+            self._not_before = max(self._not_before, time.monotonic() + seconds)
+
+    def observe(self, status: int, headers: Mapping[str, str]) -> str | None:
+        """Adjust pacing from one response; returns a notice at most once a minute."""
+        retry_after = headers.get("Retry-After")
+        delayed = bool(_header_float(headers, "X-RateLimit-Delay"))
+        limit = _header_float(headers, "X-RateLimit-Limit")
+        remaining = _header_float(headers, "X-RateLimit-Remaining")
+        reports_budget = bool(limit) and remaining is not None
+        pause = retry_delay_seconds(retry_after, 0) if retry_after else 0.0
+        spacing = _DELAYED_SPACING_S if delayed else 0.0
+        if reports_budget:
+            share = max(0.0, remaining) / limit
+            for threshold, seconds in _PACING_STEPS:
+                if share <= threshold:
+                    spacing = max(spacing, seconds)
+                    break
+
+        now = time.monotonic()
+        with self._lock:
+            if pause:
+                self._not_before = max(self._not_before, now + pause)
+            if spacing:
+                self._spacing = spacing
+                self._spacing_until = now + _PACING_HOLD_S
+            elif reports_budget:
+                self._spacing_until = 0.0
+            if not (pause or spacing or status == 429):
+                return None
+            if now - self._last_notice < _NOTICE_QUIET_S:
+                return None
+            self._last_notice = now
+
+        resource = headers.get("X-RateLimit-Resource")
+        what = "Azure DevOps is slowing this PAT's requests (rate limit"
+        if reports_budget and not delayed and status != 429:
+            what = f"Azure DevOps rate limit nearly reached ({remaining:g} of {limit:g} left"
+        what += f": {resource})" if resource else ")"
+        if pause:
+            action = f"pausing all requests for {pause:.0f} s"
+        elif spacing:
+            action = f"spacing requests {spacing:g} s apart for a while"
+        else:
+            action = "pausing all requests before retrying"
+        return (
+            f"{what}; {action}. The run continues. If this keeps appearing, "
+            "lower Catalog workers next time."
+        )
+
+
 def _wiql_literal(value: str) -> str:
     return "'" + str(value).replace("'", "''") + "'"
+
+
+# The work item $batch endpoint is documented for this API version.
+BATCH_API_VERSION = "4.1"
+WORK_ITEM_BATCH_LIMIT = 200
+PARENT_LINK = "System.LinkTypes.Hierarchy-Reverse"
+
+
+def parent_id_from_relations(relations: Any) -> int | None:
+    """The Hierarchy-Reverse parent id in a work item's ``relations``, or None."""
+    for relation in relations or []:
+        if relation.get("rel") != PARENT_LINK:
+            continue
+        url = str(relation.get("url") or "").rstrip("/")
+        try:
+            return int(url.split("/")[-1])
+        except ValueError:
+            continue
+    return None
+
+
+def _batch_item_error(item: Any) -> str | None:
+    """None when one ``$batch`` result succeeded, else its error message."""
+    if not isinstance(item, dict):
+        return "Azure DevOps returned no result for this update"
+    try:
+        code = int(item.get("code") or 0)
+    except (TypeError, ValueError):
+        code = 0
+    if 200 <= code < 300:
+        return None
+    body: Any = item.get("body")
+    if isinstance(body, str):
+        try:
+            body = json.loads(body)
+        except ValueError:
+            pass
+    message: Any = body
+    if isinstance(body, dict):
+        value = body.get("value")
+        message = (
+            (value.get("Message") if isinstance(value, dict) else None)
+            or body.get("message")
+            or body
+        )
+    return f"ADO {code or 'error'}: {str(message)[:300]}"
 
 
 class AdoClient:
@@ -149,6 +315,9 @@ class AdoClient:
         self._auth = f"Basic {token}"
         self.api_version = api_version
         self._pool = _ConnectionPool(REQUEST_TIMEOUT_S)
+        self._gate = _ThrottleGate()
+        # Called with a plain-language notice when Azure DevOps starts rate limiting.
+        self.on_throttle: Callable[[str], None] | None = None
 
     def url(self, path: str, *, project: str | None = None, api_version: str | None = None) -> str:
         version = api_version or self.api_version
@@ -178,8 +347,8 @@ class AdoClient:
         """Send a request with retries.
 
         ``idempotent=False`` (work item create) never retries after the request
-        may have reached ADO: network errors raise ``outcome_unknown`` and only
-        429/503 rejections are retried.
+        may have reached ADO: network errors and 500/502/504 raise ``outcome_unknown``
+        and only 429/503 rejections are retried.
         """
         url = absolute_url or self.url(path, project=project, api_version=api_version)
         data = None
@@ -198,8 +367,9 @@ class AdoClient:
         attempts = max(1, retry_attempts)
         for attempt in range(attempts):
             last = attempt == attempts - 1
+            self._gate.wait()
             try:
-                status, reason, retry_after, raw = self._send(method.upper(), url, data, headers)
+                status, reason, rate_headers, raw = self._send(method.upper(), url, data, headers)
             except (http.client.HTTPException, OSError) as exc:
                 if not idempotent:
                     raise AdoError(
@@ -213,6 +383,14 @@ class AdoClient:
                     ) from exc
                 time.sleep(retry_delay_seconds(None, attempt))
                 continue
+
+            rate_headers = rate_headers or {}
+            notice = self._gate.observe(status, rate_headers)
+            if notice and self.on_throttle:
+                try:
+                    self.on_throttle(notice)
+                except Exception:  # noqa: BLE001 - a notice must never fail the request
+                    pass
 
             if status == 203:
                 # ADO answers an invalid/expired PAT with a 203 HTML sign-in page.
@@ -228,14 +406,26 @@ class AdoClient:
 
             body = raw.decode("utf-8", errors="replace")[:500]
             transient = status in _REJECTED_STATUSES | _IDEMPOTENT_RETRY_STATUSES
+            if not idempotent and status in _IDEMPOTENT_RETRY_STATUSES:
+                raise AdoError(
+                    f"ADO {status} {reason}: {body} (outcome unknown, not retried: "
+                    "Azure DevOps may have done it anyway)",
+                    status=status,
+                    transient=True,
+                    outcome_unknown=True,
+                )
             if status not in retry_statuses or last:
                 raise AdoError(f"ADO {status} {reason}: {body}", status=status, transient=transient)
-            time.sleep(retry_delay_seconds(retry_after, attempt))
+            delay = retry_delay_seconds(rate_headers.get("Retry-After"), attempt)
+            if status in _REJECTED_STATUSES:
+                self._gate.pause(delay)
+            else:
+                time.sleep(delay)
         raise AdoError("ADO request failed after retries", transient=True)
 
     def _send(
         self, method: str, url: str, data: bytes | None, headers: dict[str, str]
-    ) -> tuple[int, str, str | None, bytes]:
+    ) -> tuple[int, str, dict[str, str], bytes]:
         parts = urlsplit(url)
         target = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
         conn, http_proxy_headers = self._pool.get(parts.scheme, parts.netloc)
@@ -251,7 +441,12 @@ class AdoClient:
             raise
         if response.will_close:
             self._pool.discard(parts.scheme, parts.netloc)
-        return response.status, response.reason, response.getheader("Retry-After"), raw
+        rate_headers = {
+            name: value
+            for name in _RATE_HEADERS
+            if (value := response.getheader(name)) is not None
+        }
+        return response.status, response.reason, rate_headers, raw
 
     def get(self, path: str, **kwargs: Any) -> Any:
         return self.request("GET", path, **kwargs)
@@ -343,13 +538,19 @@ class AdoClient:
         raise AdoError("Built-in Agile process not found in organization.")
 
     def create_process(self, process_name: str) -> str:
-        existing = self.get_process_id(process_name)
-        if existing:
-            return existing
+        target = process_name.strip().lower()
+        by_name: dict[str, dict[str, Any]] = {}
+        for proc in self.list_processes():
+            by_name.setdefault(str(proc.get("name") or "").strip().lower(), proc)
+        if target in by_name:
+            return str(by_name[target].get("typeId"))
+        agile = by_name.get("agile")
+        if agile is None:
+            raise AdoError("Built-in Agile process not found in organization.")
         payload = {
             "name": process_name,
             "description": f"Custom process based on Agile: {process_name}",
-            "parentProcessTypeId": self.get_agile_process_id(),
+            "parentProcessTypeId": str(agile["typeId"]),
         }
         try:
             created = self.post("/_apis/work/processes", json_body=payload, api_version="7.1-preview.2")
@@ -367,16 +568,19 @@ class AdoClient:
 
     def get_project_id(self, project_name: str) -> str | None:
         """Direct lookup by name; listing projects returns only the first 100."""
+        data = self._get_project(project_name)
+        return str(data["id"]) if data and data.get("id") else None
+
+    def _get_project(self, project_name: str) -> dict[str, Any] | None:
         name = project_name.strip()
         if not name:
             return None
         try:
-            data = self.get(f"/_apis/projects/{quote(name, safe='')}", api_version="7.1-preview.4") or {}
+            return self.get(f"/_apis/projects/{quote(name, safe='')}", api_version="7.1-preview.4") or None
         except AdoError as exc:
             if exc.status == 404:
                 return None
             raise
-        return str(data["id"]) if data.get("id") else None
 
     def get_project_process_id(self, project_id: str) -> str | None:
         """Process typeId the project was created from (System.ProcessTemplateType)."""
@@ -390,14 +594,37 @@ class AdoClient:
                 return str(prop.get("value") or "") or None
         return None
 
+    def get_ready_project_id(
+        self,
+        project_name: str,
+        *,
+        should_cancel: Callable[[], bool] | None = None,
+        on_wait: Callable[[str], None] | None = None,
+    ) -> str | None:
+        """Project id, waiting while Azure DevOps is still creating the project.
+
+        None when there is no such project (or it is being deleted). ``on_wait`` gets the
+        project's state once, before waiting.
+        """
+        data = self._get_project(project_name)
+        if not data or not data.get("id"):
+            return None
+        state = str(data.get("state") or "").lower()
+        if state == "wellformed":
+            return str(data["id"])
+        if on_wait is not None:
+            on_wait(str(data.get("state") or "unknown"))
+        return self._wait_for_project(project_name, should_cancel=should_cancel)
+
     def create_project(
         self,
         project_name: str,
         process_id: str,
         *,
         description: str = "",
+        should_cancel: Callable[[], bool] | None = None,
     ) -> str | None:
-        existing = self.get_project_id(project_name)
+        existing = self.get_ready_project_id(project_name, should_cancel=should_cancel)
         if existing:
             return existing
         payload = {
@@ -408,14 +635,95 @@ class AdoClient:
                 "processTemplate": {"templateTypeId": process_id},
             },
         }
-        self.post("/_apis/projects", json_body=payload, api_version="7.1-preview.4")
-        # Creation is async (202); poll briefly.
-        for _ in range(30):
-            time.sleep(2)
-            found = self.get_project_id(project_name)
+        try:
+            operation = self.post(
+                "/_apis/projects", json_body=payload, api_version="7.1-preview.4", idempotent=False
+            ) or {}
+        except AdoError as exc:
+            if exc.status != 409 and not exc.outcome_unknown:
+                raise
+            # 409: already exists or still being created; outcome unknown: it may have been created.
+            found = self._wait_for_project(project_name, should_cancel=should_cancel)
             if found:
                 return found
-        return self.get_project_id(project_name)
+            if exc.outcome_unknown:
+                raise AdoError(
+                    f"{exc}. Project '{project_name}' didn't appear in Azure DevOps afterwards. "
+                    "Re-run Project Creation.",
+                    outcome_unknown=True,
+                ) from exc
+            raise
+        operation_id = str(operation.get("id") or "")
+        if not operation_id:
+            found = self._wait_for_project(project_name, should_cancel=should_cancel)
+            if found:
+                return found
+            raise self._project_timeout(project_name)
+        result = self._wait_for_operation(operation_id, project_name, should_cancel=should_cancel)
+        status = str(result.get("status") or "").lower()
+        if status == "failed":
+            reason = str(result.get("resultMessage") or "").strip() or "no reason given"
+            raise AdoError(f"Azure DevOps could not create project '{project_name}': {reason}")
+        if status == "cancelled":
+            raise AdoError(f"Creating project '{project_name}' was cancelled in Azure DevOps. Re-run Project Creation.")
+        if status != "succeeded":
+            raise self._project_timeout(project_name)
+        return self._wait_for_project(project_name, should_cancel=should_cancel)
+
+    def _wait_for_operation(
+        self,
+        operation_id: str,
+        project_name: str,
+        *,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
+        """Poll a long-running operation until it finishes; returns its last state."""
+        result: dict[str, Any] = {}
+        for attempt in range(_poll_count(PROJECT_CREATE_TIMEOUT_S)):
+            if attempt:
+                time.sleep(PROJECT_POLL_INTERVAL_S)
+            self._stop_if_cancelled(should_cancel, project_name)
+            result = self.get(
+                f"/_apis/operations/{quote(operation_id, safe='')}", api_version="7.1"
+            ) or {}
+            if str(result.get("status") or "").lower() in _OPERATION_DONE:
+                break
+        return result
+
+    def _wait_for_project(
+        self, project_name: str, *, should_cancel: Callable[[], bool] | None = None
+    ) -> str | None:
+        """Project id once its state is wellFormed; None when it never shows up."""
+        missing_polls = _poll_count(PROJECT_MISSING_GRACE_S)
+        for attempt in range(_poll_count(PROJECT_CREATE_TIMEOUT_S)):
+            if attempt:
+                time.sleep(PROJECT_POLL_INTERVAL_S)
+            self._stop_if_cancelled(should_cancel, project_name)
+            data = self._get_project(project_name)
+            state = str((data or {}).get("state") or "").lower()
+            if data is None or state == "deleting":
+                if attempt + 1 >= missing_polls:
+                    return None
+                continue
+            if state == "wellformed" and data.get("id"):
+                return str(data["id"])
+        raise self._project_timeout(project_name)
+
+    @staticmethod
+    def _stop_if_cancelled(should_cancel: Callable[[], bool] | None, project_name: str) -> None:
+        if should_cancel is not None and should_cancel():
+            raise RunCancelled(
+                f"Run cancelled by user while waiting for Azure DevOps to create project "
+                f"'{project_name}'. Azure DevOps may still finish creating it; run again to use it."
+            )
+
+    @staticmethod
+    def _project_timeout(project_name: str) -> AdoError:
+        minutes = round(PROJECT_CREATE_TIMEOUT_S / 60)
+        return AdoError(
+            f"Azure DevOps was still creating project '{project_name}' after {minutes} minutes. "
+            "Wait a few minutes, then run again; the run waits for the project and uses it once it's ready."
+        )
 
     def update_project_description(self, project_id: str, description: str) -> None:
         self.patch(
@@ -511,6 +819,25 @@ class AdoClient:
 
     WIQL_PAGE = 10000
 
+    def has_work_item_with_field(self, project: str, field_ref: str) -> bool:
+        query = (
+            "SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = @project"
+            f" AND [{field_ref}] <> ''"
+        )
+        data = self.post("/_apis/wit/wiql?$top=1", {"query": query}, project=project) or {}
+        return bool(data.get("workItems"))
+
+    def find_work_items_by_field_values(self, project: str, field_ref: str, values: list[str]) -> list[int]:
+        """IDs of items whose ``field_ref`` is one of ``values`` (WIQL compares case-insensitively)."""
+        if not values:
+            return []
+        query = (
+            "SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = @project"
+            f" AND [{field_ref}] IN ({', '.join(_wiql_literal(v) for v in values)})"
+        )
+        data = self.post("/_apis/wit/wiql", {"query": query}, project=project) or {}
+        return [int(item["id"]) for item in data.get("workItems") or [] if "id" in item]
+
     def find_work_items_with_field(self, project: str, work_item_type: str, field_ref: str) -> list[int]:
         """IDs of items of one type with ``field_ref`` set, read in ID order a page at a time.
 
@@ -535,6 +862,40 @@ class AdoClient:
                 return ids
             last = max(page)
 
+    def update_work_item_fields(self, project: str, work_item_id: int, fields: dict[str, Any]) -> dict[str, Any]:
+        patch = [{"op": "add", "path": f"/fields/{ref}", "value": value} for ref, value in fields.items()]
+        return self.request(
+            "PATCH",
+            f"/_apis/wit/workitems/{int(work_item_id)}",
+            project=project,
+            json_body=patch,
+            content_type="application/json-patch+json",
+            api_version="7.1",
+        ) or {}
+
+    def update_work_items_batch(self, updates: list[tuple[int, dict[str, Any]]]) -> list[str | None]:
+        """Field updates for up to ``WORK_ITEM_BATCH_LIMIT`` work items in one ``$batch`` request.
+
+        Returns one error message (None when it worked) per update, in order: each update
+        succeeds or fails on its own. Setting the same values twice is harmless, so the
+        request is retried like a read.
+        """
+        body = [
+            {
+                "method": "PATCH",
+                "uri": f"/_apis/wit/workitems/{int(work_item_id)}?api-version={BATCH_API_VERSION}",
+                "headers": {"Content-Type": "application/json-patch+json"},
+                "body": [{"op": "add", "path": f"/fields/{ref}", "value": value} for ref, value in fields.items()],
+            }
+            for work_item_id, fields in updates
+        ]
+        data = self.post("/_apis/wit/$batch", body, api_version=BATCH_API_VERSION) or {}
+        results = data.get("value") if isinstance(data, dict) else None
+        if not isinstance(results, list) or len(results) != len(updates):
+            got = len(results) if isinstance(results, list) else "no"
+            raise AdoError(f"Unexpected $batch response: {got} result(s) for {len(updates)} update(s)")
+        return [_batch_item_error(item) for item in results]
+
     def get_parent_id(self, project: str, work_item_id: int) -> int | None:
         """Return Hierarchy-Reverse parent id, or None if unlinked."""
         data = (
@@ -546,16 +907,7 @@ class AdoClient:
             )
             or {}
         )
-        for relation in data.get("relations") or []:
-            if relation.get("rel") == "System.LinkTypes.Hierarchy-Reverse":
-                url = str(relation.get("url") or "").rstrip("/")
-                if not url:
-                    continue
-                try:
-                    return int(url.split("/")[-1])
-                except ValueError:
-                    continue
-        return None
+        return parent_id_from_relations(data.get("relations"))
 
     def add_parent_link(
         self,
@@ -572,7 +924,7 @@ class AdoClient:
                 "op": "add",
                 "path": "/relations/-",
                 "value": {
-                    "rel": "System.LinkTypes.Hierarchy-Reverse",
+                    "rel": PARENT_LINK,
                     "url": parent_url,
                     "attributes": {"comment": "Backfilled imported parent link"},
                 },
@@ -586,14 +938,32 @@ class AdoClient:
             project=project,
             json_body=patch,
             content_type="application/json-patch+json",
+            # A retry after a lost response fails with "already has a parent".
+            idempotent=False,
         )
 
-    def get_work_items_batch(self, project: str, ids: list[int]) -> list[dict[str, Any]]:
-        """Up to 200 work items with all fields; deleted or inaccessible IDs are left out."""
+    def get_work_items_batch(
+        self,
+        project: str,
+        ids: list[int],
+        *,
+        fields: list[str] | None = None,
+        expand_relations: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Up to 200 work items (all fields unless ``fields``); deleted or inaccessible IDs are left out.
+
+        Azure DevOps refuses ``fields`` together with an expand, so ``expand_relations``
+        returns every field as well.
+        """
+        body: dict[str, Any] = {"ids": [int(i) for i in ids], "errorPolicy": "omit"}
+        if expand_relations:
+            body["$expand"] = "relations"
+        elif fields:
+            body["fields"] = list(fields)
         data = self.post(
             "/_apis/wit/workitemsbatch",
             project=project,
-            json_body={"ids": [int(i) for i in ids], "errorPolicy": "omit"},
+            json_body=body,
             api_version="7.1",
         ) or {}
         return [item for item in data.get("value") or [] if item]

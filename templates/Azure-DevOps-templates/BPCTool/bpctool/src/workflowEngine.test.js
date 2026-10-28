@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
+  completionScope,
   migrateCompletedStepIds,
   resolveTargetSteps,
   runWorkflowFlow,
@@ -39,6 +40,30 @@ describe('migrateCompletedStepIds', () => {
     expect(migrateCompletedStepIds(['creation', 'layout'])).toEqual([
       'process',
       'project',
+      'layout',
+    ])
+  })
+})
+
+describe('completionScope', () => {
+  const cacheKey = 'https://dev.azure.com/contoso::bpc::contoso-bpc'
+
+  it('persists only Runner-mode completions under the shared key', () => {
+    expect(completionScope('runner', cacheKey)).toEqual({ key: cacheKey, persisted: true })
+    expect(completionScope('simulate', cacheKey)).toEqual({
+      key: `simulate::${cacheKey}`,
+      persisted: false,
+    })
+    expect(completionScope('api', cacheKey)).toEqual({ key: `api::${cacheKey}`, persisted: false })
+    expect(completionScope('runner', null)).toBeNull()
+  })
+
+  it('keeps simulated steps from letting a later Runner run skip Process and Layout', () => {
+    const cache = { [completionScope('simulate', cacheKey).key]: ['process', 'layout'] }
+    const runnerCompleted = cache[completionScope('runner', cacheKey).key] ?? []
+
+    expect(resolveTargetSteps('full', 'process', runnerCompleted).slice(0, 2)).toEqual([
+      'process',
       'layout',
     ])
   })

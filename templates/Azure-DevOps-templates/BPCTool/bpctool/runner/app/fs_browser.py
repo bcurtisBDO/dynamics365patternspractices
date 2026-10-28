@@ -9,6 +9,22 @@ from typing import Any
 from .paths import bpc_files_root, resolve_release_folder
 
 
+NETWORK_PATH_ERROR = (
+    "Network paths (starting with \\\\ or //) aren't supported. "
+    "Choose a folder on this computer, or map the share to a drive letter."
+)
+
+
+def is_network_path(path_str: str) -> bool:
+    """True for UNC / device paths (\\\\host\\share, //host/share, \\\\?\\UNC\\..., \\\\.\\...).
+
+    Opening one makes Windows connect to the host over SMB and send the user's
+    credentials, so a web page could trigger it with a plain GET to the runner.
+    """
+    head = path_str.strip()[:2]
+    return len(head) == 2 and all(char in "\\/" for char in head)
+
+
 def _home() -> Path:
     return Path.home().expanduser().resolve()
 
@@ -44,6 +60,8 @@ def list_roots() -> list[dict[str, str]]:
 
 def list_directory(path_str: str | None, *, directories_only: bool = False) -> dict[str, Any]:
     if path_str and path_str.strip():
+        if is_network_path(path_str):
+            raise ValueError(NETWORK_PATH_ERROR)
         current = Path(path_str).expanduser()
         if not current.is_absolute():
             raise ValueError(

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
 import {
   DEVLABS_MULTIVALUE,
@@ -6,6 +6,7 @@ import {
   fetchProjects,
   getMultivalueExtensionStatus,
   installMultivalueExtension,
+  multivalueStatusNeedsCheck,
   stepsRequireMultivalueExtension,
 } from './adoApi'
 import { normalizeAdoOrgUrl, parseAdoOrgUrl } from './adoOrgUrl'
@@ -14,6 +15,7 @@ import ConnectionPanel from './ConnectionPanel'
 import PathPickerModal from './PathPickerModal'
 import {
   assessExistingTargets,
+  buildWorkbookApplyRecord,
   validateTargetNames,
   workbookApplyKey,
 } from './targetAssessment'
@@ -28,6 +30,7 @@ import {
   runRunnerJob,
 } from './runnerApi'
 import {
+  completionScope,
   formatDurationMs,
   formatTimingSummary,
   migrateCompletedStepIds,
@@ -62,6 +65,14 @@ const loadJson = (key, fallbackValue) => {
     return JSON.parse(localStorage.getItem(key) ?? JSON.stringify(fallbackValue))
   } catch {
     return fallbackValue
+  }
+}
+
+const writeLocalJson = (key, value) => {
+  try {
+    localStorage.setItem(key, JSON.stringify(value))
+  } catch {
+    /* storage blocked / quota */
   }
 }
 
@@ -219,6 +230,7 @@ function App() {
   const [runMessage, setRunMessage] = useState('No action run yet.')
   const [runLogs, setRunLogs] = useState([])
   const [isRunning, setIsRunning] = useState(false)
+  const [runStarting, setRunStarting] = useState(false)
   const [completionCache, setCompletionCache] = useState(() => {
     try {
       localStorage.removeItem('bpcProfiles')
@@ -227,9 +239,11 @@ function App() {
       /* ignore */
     }
     const scoped = normalizeCompletionCache(loadJson(COMPLETION_CACHE_KEY, {}))
-    localStorage.setItem(COMPLETION_CACHE_KEY, JSON.stringify(scoped))
+    writeLocalJson(COMPLETION_CACHE_KEY, scoped)
     return scoped
   })
+  // Simulate / API completions: display only, never persisted (see completionScope).
+  const [practiceCompletions, setPracticeCompletions] = useState({})
   const [workbookApplies, setWorkbookApplies] = useState(() =>
     normalizeWorkbookApplies(loadJson(WORKBOOK_APPLIES_KEY, {})),
   )
@@ -356,22 +370,35 @@ function App() {
   // previous connection doesn't record its lists against the new one.
   const connectionGenRef = useRef(0)
 
+  // The previous connection's result must not satisfy the run gate during the check debounce.
+  const resetExtensionCheck = () => {
+    setExtensionStatus('unknown')
+    setExtensionMessage('')
+    setExtensionBusy(false)
+  }
+
   const setOrgUrl = (value) => {
     connectionGenRef.current += 1
+    resetExtensionCheck()
     setOrgUrlState(value)
     writeSession(SESSION_ORG_URL, value)
     setProjects([])
     setProjectsFetched(false)
+    setFetchingProjects(false)
     setProcesses([])
     setProcessesFetched(false)
+    setFetchingProcesses(false)
   }
 
   const setPat = (value) => {
     connectionGenRef.current += 1
+    resetExtensionCheck()
     setPatState(value)
     writeSession(SESSION_PAT, value)
     setProjectsFetched(false)
+    setFetchingProjects(false)
     setProcessesFetched(false)
+    setFetchingProcesses(false)
   }
 
   const setProjectName = (value) => {
@@ -446,16 +473,18 @@ function App() {
       return undefined
     }
 
-    let cancelled = false
-    ;(async () => {
+    const controller = new AbortController()
+    const { signal } = controller
+    const timer = setTimeout(async () => {
       setExtensionBusy(true)
       setExtensionStatus('checking')
       try {
         const result = await getMultivalueExtensionStatus(
           effectiveOrgUrl,
           pat.trim(),
+          { signal },
         )
-        if (cancelled) {
+        if (signal.aborted) {
           return
         }
         setExtensionStatus(result.status)
@@ -473,7 +502,7 @@ function App() {
           )
         }
       } catch (error) {
-        if (cancelled) {
+        if (signal.aborted) {
           return
         }
         const message =
@@ -481,14 +510,15 @@ function App() {
         setExtensionStatus('error')
         setExtensionMessage(`Could not verify Multivalue extension: ${message}`)
       } finally {
-        if (!cancelled) {
+        if (!signal.aborted) {
           setExtensionBusy(false)
         }
       }
-    })()
+    }, 600)
 
     return () => {
-      cancelled = true
+      controller.abort()
+      clearTimeout(timer)
     }
   }, [extensionCheckable, effectiveOrgUrl, pat])
 
@@ -524,10 +554,19 @@ function App() {
     ],
   )
 
-  const completedStepIds = useMemo(
-    () => (cacheKey ? migrateCompletedStepIds(completionCache[cacheKey] ?? []) : []),
-    [cacheKey, completionCache],
+  const scope = useMemo(
+    () => completionScope(executionMode, cacheKey),
+    [executionMode, cacheKey],
   )
+  const completionKey = scope?.key ?? null
+
+  const completedStepIds = useMemo(() => {
+    if (!scope) {
+      return []
+    }
+    const cache = scope.persisted ? completionCache : practiceCompletions
+    return migrateCompletedStepIds(cache[scope.key] ?? [])
+  }, [scope, completionCache, practiceCompletions])
 
   const plannedStepIds = useMemo(
     () => resolveTargetSteps(runMode, selectedWorkflowId, completedStepIds),
@@ -559,12 +598,12 @@ function App() {
 
   const stepStatuses = useMemo(() => {
     const base = buildStepStatuses(completedStepIds)
-    if (runOverlay.key !== cacheKey) {
+    if (runOverlay.key !== completionKey) {
       return base
     }
 
     return { ...base, ...runOverlay.statuses }
-  }, [completedStepIds, runOverlay, cacheKey])
+  }, [completedStepIds, runOverlay, completionKey])
 
   const selectedWorkflow = useMemo(
     () =>
@@ -618,7 +657,7 @@ function App() {
   const persistCompletionCache = (updater) => {
     setCompletionCache((previous) => {
       const nextCache = typeof updater === 'function' ? updater(previous) : updater
-      localStorage.setItem(COMPLETION_CACHE_KEY, JSON.stringify(nextCache))
+      writeLocalJson(COMPLETION_CACHE_KEY, nextCache)
       return nextCache
     })
   }
@@ -642,6 +681,7 @@ function App() {
       return 'unknown'
     }
 
+    const generation = connectionGenRef.current
     setExtensionBusy(true)
     setExtensionStatus('checking')
     setExtensionMessage('Checking DevLabs Multivalue control on the organization…')
@@ -650,6 +690,9 @@ function App() {
         effectiveOrgUrl,
         pat.trim(),
       )
+      if (generation !== connectionGenRef.current) {
+        return result.status
+      }
       setExtensionStatus(result.status)
       if (result.status === 'installed') {
         setExtensionMessage(
@@ -666,6 +709,9 @@ function App() {
       }
       return result.status
     } catch (error) {
+      if (generation !== connectionGenRef.current) {
+        return 'error'
+      }
       const message =
         error instanceof Error ? error.message : 'Extension check failed'
       setExtensionStatus('error')
@@ -680,14 +726,17 @@ function App() {
     if (!connectionReady) {
       return false
     }
+    const generation = connectionGenRef.current
     setExtensionBusy(true)
     setExtensionMessage('Installing DevLabs Multivalue control…')
     try {
       await installMultivalueExtension(effectiveOrgUrl, pat.trim())
-      setExtensionStatus('installed')
-      setExtensionMessage(
-        `${DEVLABS_MULTIVALUE.displayName} installed successfully.`,
-      )
+      if (generation === connectionGenRef.current) {
+        setExtensionStatus('installed')
+        setExtensionMessage(
+          `${DEVLABS_MULTIVALUE.displayName} installed successfully.`,
+        )
+      }
       addLog('Installed DevLabs Multivalue control extension on organization.')
       return true
     } catch (error) {
@@ -722,11 +771,7 @@ function App() {
     }
 
     let status = extensionStatus
-    if (
-      status === 'unknown' ||
-      status === 'error' ||
-      status === 'checking'
-    ) {
+    if (multivalueStatusNeedsCheck(status)) {
       status = await refreshMultivalueExtension()
     }
 
@@ -818,7 +863,9 @@ function App() {
       setRunMessage(`Fetch projects failed: ${message}`)
       addLog(`API error: ${message}`)
     } finally {
-      setFetchingProjects(false)
+      if (generation === connectionGenRef.current) {
+        setFetchingProjects(false)
+      }
     }
   }
 
@@ -855,7 +902,9 @@ function App() {
       setRunMessage(`Fetch processes failed: ${message}`)
       addLog(`API error: ${message}`)
     } finally {
-      setFetchingProcesses(false)
+      if (generation === connectionGenRef.current) {
+        setFetchingProcesses(false)
+      }
     }
   }
 
@@ -865,21 +914,24 @@ function App() {
     if (!connectionReady || executionMode === 'simulate') {
       return undefined
     }
-    let cancelled = false
+    const controller = new AbortController()
+    const { signal } = controller
+    let started = false
     const orgUrlAtStart = effectiveOrgUrl
     const token = pat.trim()
     const timer = setTimeout(async () => {
+      started = true
       setFetchingProjects(true)
       setFetchingProcesses(true)
       const [projectsResult, processesResult] = await Promise.allSettled([
-        fetchProjects(orgUrlAtStart, token),
-        fetchProcesses(orgUrlAtStart, token),
+        fetchProjects(orgUrlAtStart, token, { signal }),
+        fetchProcesses(orgUrlAtStart, token, { signal }),
       ])
-      setFetchingProjects(false)
-      setFetchingProcesses(false)
-      if (cancelled) {
+      if (signal.aborted) {
         return
       }
+      setFetchingProjects(false)
+      setFetchingProcesses(false)
       const found = []
       const failed = []
       const reason = (result) =>
@@ -912,51 +964,70 @@ function App() {
       addLog(`API: loaded existing targets automatically — ${status}`)
     }, 600)
     return () => {
-      cancelled = true
+      controller.abort()
       clearTimeout(timer)
+      // Nothing re-sets these if the connection stops being usable; a newer fetch sets them again.
+      if (started) {
+        setFetchingProjects(false)
+        setFetchingProcesses(false)
+      }
     }
   }, [connectionReady, executionMode, effectiveOrgUrl, pat, inventoryRefreshKey])
 
+  const recordCompletions = (targetScope, updater) => {
+    if (!targetScope) {
+      return
+    }
+    const update = (previous) => ({
+      ...previous,
+      [targetScope.key]: updater(migrateCompletedStepIds(previous[targetScope.key] ?? [])),
+    })
+    if (targetScope.persisted) {
+      persistCompletionCache(update)
+    } else {
+      setPracticeCompletions(update)
+    }
+  }
+
   const clearCompletionCache = () => {
-    if (!cacheKey) {
+    if (!scope) {
       setRunOverlay({ key: null, statuses: {} })
       setRunMessage('Enter org URL and process name to clear a scoped completion cache.')
       return
     }
 
-    persistCompletionCache((previous) => {
+    const withoutKey = (previous) => {
       const nextCache = { ...previous }
-      delete nextCache[cacheKey]
+      delete nextCache[scope.key]
       return nextCache
-    })
-    setRunOverlay({ key: cacheKey, statuses: {} })
+    }
+    if (scope.persisted) {
+      persistCompletionCache(withoutKey)
+    } else {
+      setPracticeCompletions(withoutKey)
+    }
+    setRunOverlay({ key: scope.key, statuses: {} })
     setRunMessage('Completion cache cleared for this org/process/project. Steps reset to Not run.')
   }
 
-  const persistWorkbookApply = (applied) => {
-    if (!applied?.fingerprint || !applied.processName) {
+  const persistWorkbookApply = ({ orgUrl: appliedOrgUrl, processName: appliedProcess, ...workbook }) => {
+    if (!appliedProcess || !workbook.templatePath?.trim()) {
       return
     }
 
-    const key = workbookApplyKey(effectiveOrgUrl, applied.processName)
-    const next = {
-      ...workbookApplies,
-      [key]: {
-        fingerprint: applied.fingerprint,
-        templatePath: templatePath.trim(),
-        workbookVersion: workbookVersion.trim(),
-        appliedAt: new Date().toISOString(),
-      },
-    }
-    localStorage.setItem(WORKBOOK_APPLIES_KEY, JSON.stringify(next))
-    setWorkbookApplies(next)
+    const key = workbookApplyKey(appliedOrgUrl, appliedProcess)
+    setWorkbookApplies((previous) => {
+      const next = { ...previous, [key]: buildWorkbookApplyRecord(workbook) }
+      writeLocalJson(WORKBOOK_APPLIES_KEY, next)
+      return next
+    })
   }
 
   const setStepStatus = (stepId, status) => {
     setRunOverlay((current) => ({
-      key: cacheKey,
+      key: completionKey,
       statuses: {
-        ...(current.key === cacheKey ? current.statuses : {}),
+        ...(current.key === completionKey ? current.statuses : {}),
         [stepId]: status,
       },
     }))
@@ -981,8 +1052,11 @@ function App() {
       await cancelRunnerJob(jobId)
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Cancel request failed.'
-      addLog(`Cancel failed (${message}); stopped watching the job instead.`)
-      abortControllerRef.current?.abort()
+      addLog(`Cancel failed (${message}); still watching the job.`)
+      setCancelRequested(false)
+      setRunMessage(
+        `Cancel request failed: ${message}. The run may still be going — click Cancel run to try again.`,
+      )
     }
   }
 
@@ -996,20 +1070,28 @@ function App() {
     setCatalogProgress(null)
     setRunOutcome(null)
     setRunLogs([])
-    setRunOverlay({ key: cacheKey, statuses: {} })
+    setRunOverlay({ key: completionKey, statuses: {} })
     return abortController
   }
 
-  const endRun = () => {
+  /** keepRunnerJob: the job may still be running, so a reload can reattach to it. */
+  const endRun = ({ keepRunnerJob = false } = {}) => {
     isRunningRef.current = false
     abortControllerRef.current = null
     activeJobIdRef.current = null
     runnerJobStartingRef.current = false
     pendingCancelRef.current = false
-    writeSession(SESSION_ACTIVE_RUNNER_JOB, '')
+    if (!keepRunnerJob) {
+      writeSession(SESSION_ACTIVE_RUNNER_JOB, '')
+    }
     setIsRunning(false)
     setCancelRequested(false)
   }
+
+  const runnerJobMayStillRun = (error) =>
+    Boolean(activeJobIdRef.current) &&
+    error?.status !== 404 &&
+    !String(error?.message || '').startsWith('Job not found')
 
   const rememberRunnerJob = (jobId, context) => {
     activeJobIdRef.current = jobId
@@ -1019,6 +1101,7 @@ function App() {
       pendingCancelRef.current = false
       cancelRunnerJob(jobId).catch((error) => {
         addLog(`Cancel failed: ${error instanceof Error ? error.message : error}`)
+        setCancelRequested(false)
       })
     }
   }
@@ -1069,15 +1152,12 @@ function App() {
   }
 
   const recordCompletedSteps = (activeCacheKey, stepIds) => {
-    if (!activeCacheKey || stepIds.length === 0) {
+    if (stepIds.length === 0) {
       return
     }
-    persistCompletionCache((previous) => ({
-      ...previous,
-      [activeCacheKey]: Array.from(
-        new Set([...migrateCompletedStepIds(previous[activeCacheKey] ?? []), ...stepIds]),
-      ),
-    }))
+    recordCompletions(completionScope('runner', activeCacheKey), (previous) =>
+      Array.from(new Set([...previous, ...stepIds])),
+    )
   }
 
   const finishRunnerJob = (job, context) => {
@@ -1107,10 +1187,13 @@ function App() {
       // otherwise dependency-aware runs skip real work next time.
       if (!context.dryRun) {
         recordCompletedSteps(activeCacheKey, finished)
-        if (finished.includes('process') && job.result?.workbook_fingerprint) {
+        if (finished.includes('process')) {
           persistWorkbookApply({
-            fingerprint: job.result.workbook_fingerprint,
+            orgUrl: context.orgUrl,
             processName: context.processName,
+            templatePath: context.templatePath,
+            workbookVersion: context.workbookVersion,
+            runnerFingerprint: job.result?.workbook_fingerprint,
           })
         }
       }
@@ -1141,14 +1224,16 @@ function App() {
     setRunMessage(`Runner job failed: ${job.error || 'unknown error'}.${timingNote}${resultsNote}`)
   }
 
-  const setUpCatalogRerun = () => {
+  const setUpCatalogRerun = useCallback(() => {
     setSelectedWorkflowId('catalog')
     setRunMode('step')
     setDryRun(false)
     setRunMessage(
       'Catalog Import is selected with “Selected step only”. Fix the rows listed in the results, then click Run selected flow (live) — items already imported are skipped.',
     )
-  }
+  }, [])
+
+  const dismissRunOutcome = useCallback(() => setRunOutcome(null), [])
 
   const reattachRunnerJob = async (saved) => {
     if (isRunningRef.current) {
@@ -1157,6 +1242,7 @@ function App() {
     const abortController = beginRun()
     activeJobIdRef.current = saved.jobId
     setRunMessage(`Reattaching to runner job ${saved.jobId} started before the page reloaded...`)
+    let keepRunnerJob = false
     try {
       const job = await pollRunnerJob(saved.jobId, {
         signal: abortController.signal,
@@ -1165,13 +1251,14 @@ function App() {
       finishRunnerJob(job, saved)
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unexpected runner error.'
+      keepRunnerJob = runnerJobMayStillRun(error)
       setRunMessage(
-        message.startsWith('Job not found')
-          ? 'The previous runner job is no longer available (the runner was restarted, or it has finished 20 newer jobs since and keeps only the latest 20).'
-          : `Stopped watching runner job: ${message}`,
+        keepRunnerJob
+          ? `Stopped watching runner job: ${message}. It may still be running — reload the page to reattach.`
+          : 'The previous runner job is no longer available (the runner was restarted, or it has finished 20 newer jobs since and keeps only the latest 20).',
       )
     } finally {
-      endRun()
+      endRun({ keepRunnerJob })
     }
   }
 
@@ -1294,8 +1381,20 @@ function App() {
       return
     }
 
-    const extensionOk = await ensureMultivalueExtensionForSetup()
+    // Claimed before the first await so a second click can't start another job.
+    isRunningRef.current = true
+    setRunStarting(true)
+    let extensionOk = false
+    try {
+      extensionOk = await ensureMultivalueExtensionForSetup()
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Extension check failed'
+      setRunMessage(`Flow failed: ${message}`)
+    } finally {
+      setRunStarting(false)
+    }
     if (!extensionOk) {
+      isRunningRef.current = false
       return
     }
 
@@ -1335,6 +1434,7 @@ function App() {
       executionMode,
     }
 
+    let keepRunnerJob = false
     try {
       if (executionMode === 'runner') {
         if (dryRun) {
@@ -1351,6 +1451,8 @@ function App() {
           orgUrl: runConfig.orgUrl,
           processName: runConfig.processName,
           projectName: runConfig.projectName,
+          templatePath: runConfig.templatePath,
+          workbookVersion: runConfig.workbookVersion,
         }
         runnerJobStartingRef.current = true
         const job = await runRunnerJob(
@@ -1449,21 +1551,12 @@ function App() {
           ? result.completedStepIds
           : completedStepIds
 
-        const activeCacheKey = buildCacheKey(
-          runConfig.orgUrl,
-          runConfig.processName,
-          runConfig.projectName,
+        const runScope = completionScope(
+          executionMode,
+          buildCacheKey(runConfig.orgUrl, runConfig.processName, runConfig.projectName),
         )
-        if (activeCacheKey) {
-          persistCompletionCache((previous) => ({
-            ...previous,
-            [activeCacheKey]: nextCompleted,
-          }))
-        }
-
-        if (result.appliedWorkbook) {
-          persistWorkbookApply(result.appliedWorkbook)
-        }
+        const activeCacheKey = runScope?.key ?? null
+        recordCompletions(runScope, () => nextCompleted)
 
         const timingNote =
           result.durationMs != null
@@ -1509,10 +1602,15 @@ function App() {
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unexpected runner error.'
-      setRunMessage(`Flow failed: ${message}`)
+      keepRunnerJob = executionMode === 'runner' && runnerJobMayStillRun(error)
+      setRunMessage(
+        keepRunnerJob
+          ? `Stopped watching the runner job: ${message}. It may still be running — reload the page to reattach.`
+          : `Flow failed: ${message}`,
+      )
       addLog(`Runner error: ${message}`)
     } finally {
-      endRun()
+      endRun({ keepRunnerJob })
     }
   }
 
@@ -2079,6 +2177,7 @@ function App() {
             onClick={runWorkflow}
             disabled={
               isRunning ||
+              runStarting ||
               !connectionReady ||
               !nameValidation.ok
             }
@@ -2128,8 +2227,8 @@ function App() {
               {planResult.summary?.counts?.area_paths ?? 0} areas,{' '}
               {planResult.summary?.counts?.catalog_rows ?? 0} catalog rows
             </p>
-            {(planResult.notices || []).map((notice) => (
-              <p key={notice} className="run-notice">
+            {(planResult.notices || []).map((notice, index) => (
+              <p key={`${index}:${notice}`} className="run-notice">
                 {notice}
               </p>
             ))}
@@ -2145,15 +2244,15 @@ function App() {
             </ol>
             {(planResult.warnings || []).length > 0 ? (
               <ul className="plan-warnings">
-                {planResult.warnings.map((warning) => (
-                  <li key={warning}>{warning}</li>
+                {planResult.warnings.map((warning, index) => (
+                  <li key={`${index}:${warning}`}>{warning}</li>
                 ))}
               </ul>
             ) : null}
             {(planResult.errors || []).length > 0 ? (
               <ul className="plan-errors">
-                {planResult.errors.map((error) => (
-                  <li key={error}>{error}</li>
+                {planResult.errors.map((error, index) => (
+                  <li key={`${index}:${error}`}>{error}</li>
                 ))}
               </ul>
             ) : null}
@@ -2164,11 +2263,11 @@ function App() {
         <RunResultsCard
           outcome={runOutcome}
           onRerunCatalog={setUpCatalogRerun}
-          onDismiss={() => setRunOutcome(null)}
+          onDismiss={dismissRunOutcome}
         />
 
-        <div className="run-log" role="status" aria-live="polite">
-          <p>{runMessage}</p>
+        <div className="run-log">
+          <p role="status">{runMessage}</p>
           {catalogProgressSummary ? (
             <div className="catalog-progress">
               <div className="catalog-progress-label">
@@ -2182,7 +2281,9 @@ function App() {
               />
             </div>
           ) : null}
-          <pre>{runLogs.length > 0 ? runLogs.join('\n') : 'No execution logs yet.'}</pre>
+          <pre role="log" aria-live="off" aria-label="Execution log">
+            {runLogs.length > 0 ? runLogs.join('\n') : 'No execution logs yet.'}
+          </pre>
         </div>
       </section>
 

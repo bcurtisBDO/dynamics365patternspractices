@@ -23,6 +23,7 @@ from .mapping import build_mapping_from_ir
 from .org_url import normalize_ado_org_url
 from .output_folder import folder_lock_key
 from .planner import build_dry_run_plan
+from .writers.process import states_added_by_process
 from .run_outcome import catalog_placeholder_count, project_name_notice
 from .timing import format_duration_ms
 
@@ -71,10 +72,15 @@ def run_dry_run(request: DryRunRequest) -> DryRunResponse:
         step_filter=request.steps,
     )
     if (not request.steps or "catalog" in request.steps) and ir["counts"].get("catalog_rows"):
+        process_step = next((step for step in plan.steps if step["id"] == "process"), {})
+        process_runs = (not request.steps or "process" in request.steps) and process_step.get(
+            "planned_action"
+        ) not in {None, "skip"}
         plan.data_checks = catalog_data_checks(
             ir,
             area_root=request.root_area_path or request.project_name,
             include_deprecated_deleted=request.include_deprecated_deleted,
+            planned_states=states_added_by_process(ir) if process_runs else None,
         )
         retired = int(plan.data_checks.get("retiredSkipped") or 0)
         if retired:
@@ -93,7 +99,11 @@ def run_dry_run(request: DryRunRequest) -> DryRunResponse:
 
 
 def catalog_data_checks(
-    ir: dict[str, Any], *, area_root: str = "", include_deprecated_deleted: bool = False
+    ir: dict[str, Any],
+    *,
+    area_root: str = "",
+    include_deprecated_deleted: bool = False,
+    planned_states: dict[str, list[str]] | None = None,
 ) -> dict[str, Any]:
     """Offline catalog checks (no Azure DevOps calls); project areas and States need a run."""
     mapping = build_mapping_from_ir(ir)
@@ -101,7 +111,9 @@ def catalog_data_checks(
     retired = []
     if not include_deprecated_deleted:
         drafts, retired = split_retired_drafts(drafts)
-    result = prevalidate_catalog_drafts(drafts, ir, mapping, sanitize=True, area_root=area_root)
+    result = prevalidate_catalog_drafts(
+        drafts, ir, mapping, sanitize=True, area_root=area_root, planned_states=planned_states
+    )
     return {**prevalidate_summary(result, examples=3), "retiredSkipped": len(retired)}
 
 

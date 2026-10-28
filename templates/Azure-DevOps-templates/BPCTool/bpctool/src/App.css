@@ -163,10 +163,6 @@ textarea {
   margin-bottom: 12px;
 }
 
-.panel-heading-row h2 {
-  margin: 0;
-}
-
 .connection-pill {
   flex-shrink: 0;
 }
@@ -446,8 +442,24 @@ select:disabled {
   margin-bottom: 0;
 }
 
-.collapsible-trigger h2 {
+/* The h2 wraps the toggle button; the title span carries the heading look. */
+.panel h2.collapsible-heading {
   margin: 0;
+  font: inherit;
+  letter-spacing: inherit;
+  color: inherit;
+}
+
+.collapsible-title {
+  font-family: var(--heading);
+  font-size: 22px;
+  font-weight: 500;
+  line-height: 118%;
+  letter-spacing: -0.24px;
+  color: var(--text-h);
+  @media (max-width: 1024px) {
+    font-size: 20px;
+  }
 }
 
 .collapse-meta {
@@ -807,6 +819,21 @@ select:disabled {
   text-decoration: none;
   display: inline-flex;
   align-items: center;
+}
+
+.run-results-ado-links {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+  margin: 10px 14px 0;
+  font-size: 14px;
+}
+
+.run-results-ado-links em {
+  flex-basis: 100%;
+  color: var(--text);
+  font-size: 13px;
 }
 
 .attention-list {

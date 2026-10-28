@@ -17,6 +17,38 @@ export function buildWorkbookFingerprint({ templatePath, workbookVersion }) {
   return `${path}::${version || 'unversioned'}`
 }
 
+/**
+ * Record of a workbook applied to a process. `fingerprint` is always the UI's path::version
+ * form so it compares with buildWorkbookFingerprint; the runner's content hash
+ * ('sha256:…::label') is kept separately for reference.
+ */
+export function buildWorkbookApplyRecord({
+  templatePath,
+  workbookVersion,
+  runnerFingerprint = '',
+  appliedAt = new Date().toISOString(),
+}) {
+  return {
+    fingerprint: buildWorkbookFingerprint({ templatePath, workbookVersion }),
+    runnerFingerprint: runnerFingerprint || '',
+    templatePath: String(templatePath || '').trim(),
+    workbookVersion: String(workbookVersion || '').trim(),
+    appliedAt,
+  }
+}
+
+/** Fingerprint of a stored apply record in buildWorkbookFingerprint form, when it can be derived. */
+export function appliedWorkbookFingerprint(lastAppliedWorkbook) {
+  if (!lastAppliedWorkbook) {
+    return null
+  }
+  // Older records saved the runner's hash as `fingerprint`; their path/version still compare.
+  if (String(lastAppliedWorkbook.templatePath || '').trim()) {
+    return buildWorkbookFingerprint(lastAppliedWorkbook)
+  }
+  return lastAppliedWorkbook.fingerprint ?? null
+}
+
 export function assessExistingTargets({
   processName,
   projectName,
@@ -34,7 +66,7 @@ export function assessExistingTargets({
   )
 
   const nextFingerprint = buildWorkbookFingerprint({ templatePath, workbookVersion })
-  const previousFingerprint = lastAppliedWorkbook?.fingerprint ?? null
+  const previousFingerprint = appliedWorkbookFingerprint(lastAppliedWorkbook)
   const workbookChanged =
     Boolean(templatePath?.trim()) &&
     (!previousFingerprint || previousFingerprint !== nextFingerprint)

@@ -35,6 +35,7 @@ AUTOMATIC_FIX_KINDS = (
 # Values that were dropped, shortened or are still questionable — worth a look.
 REVIEW_KINDS = (
     "invalid_area_path",
+    "invalid_iteration_path",
     "invalid_state",
     "invalid_picklist_value",
     "multiple_values_single_select",
@@ -89,6 +90,15 @@ ISSUE_TEXT: dict[str, dict[str, str]] = {
         "label": "Area path is not in the template",
         "outcome": "Area path removed — the item is placed at the project's root area.",
         "fix": "Add the path to the template Area paths sheet, or correct the Area path column in the catalog row.",
+    },
+    "invalid_iteration_path": {
+        "label": "Iteration path is not in the template",
+        "outcome": "Iteration path replaced with the project name — the item is placed at the project's root iteration.",
+        "fix": (
+            "Nothing to do if the value is the name of the project the catalog came from. Otherwise add "
+            "the iteration to the template Iteration paths sheet, or correct the Iteration path column "
+            "in the catalog row."
+        ),
     },
     "invalid_state": {
         "label": "State is not valid for this work item type",
@@ -233,6 +243,7 @@ def prevalidate_catalog_drafts(
     extra_area_paths: list[str] | None = None,
     allowed_states: dict[str, list[str]] | None = None,
     area_root: str = "",
+    planned_states: dict[str, list[str]] | None = None,
 ) -> PrevalidateResult:
     """Validate drafts; optionally strip/normalize values that hard-fail create.
 
@@ -252,6 +263,8 @@ def prevalidate_catalog_drafts(
     project (Run configuration *Root area path*), template areas live under it, as
     the Teams step creates them. States are checked only when
     ``allowed_states`` (work item type → states) is supplied, i.e. on live runs.
+    ``planned_states`` are states this run's Process step adds before the import,
+    so they count as valid even when Azure DevOps doesn't list them yet.
     """
     result = PrevalidateResult()
     project = (project or (ir.get("targets") or {}).get("project_name") or "").strip()
@@ -293,6 +306,13 @@ def prevalidate_catalog_drafts(
         for wit, states in (allowed_states or {}).items()
         if states
     }
+    planned_by_wit = {
+        normalize(wit): {str(s).casefold(): str(s) for s in states}
+        for wit, states in (planned_states or {}).items()
+    }
+    for wit_norm, planned in planned_by_wit.items():
+        if wit_norm in states_by_wit:
+            states_by_wit[wit_norm] = {**planned, **states_by_wit[wit_norm]}
 
     picklists = ir.get("process", {}).get("picklists") or {}
     # label → {lowercase value → canonical template casing}
@@ -394,6 +414,8 @@ def prevalidate_catalog_drafts(
                     draft.fields[ref] = replaced
 
         # Area path
+        # Old project name seen as the area path's first part; an iteration path naming it is renamed too.
+        other_project = ""
         area = draft.fields.get("System.AreaPath")
         if area is not None and str(area).strip():
             area_text = str(area).strip()
@@ -441,6 +463,7 @@ def prevalidate_catalog_drafts(
                 else:
                     target = f"{project}\\{canonical_rel}" if canonical_rel else project
                     if renamed:
+                        other_project = parts[0].lower()
                         add(
                             "System.AreaPath",
                             area_text,
@@ -477,7 +500,20 @@ def prevalidate_catalog_drafts(
                 rest = known_iterations.get("\\".join(parts[1:]).lower(), "")
                 target = f"{project}\\{rest}" if rest else project
             if target and target != iteration_text:
-                if parts[0].lower() not in {project.lower(), *_PROJECT_PLACEHOLDERS}:
+                names_project = parts[0].lower() in {project.lower(), *_PROJECT_PLACEHOLDERS}
+                unknown_root = len(parts) == 1 and joined not in known_iterations and joined != other_project
+                if not names_project and unknown_root:
+                    # One unknown segment: another project's name or an iteration missing from the template.
+                    add(
+                        "System.IterationPath",
+                        iteration_text,
+                        "invalid_iteration_path",
+                        "sanitize" if sanitize else "report",
+                        f"'{iteration_text}' is not in the template Iteration paths sheet; "
+                        f"placed at the project's root iteration '{project}'",
+                        target,
+                    )
+                elif not names_project:
                     add(
                         "System.IterationPath",
                         iteration_text,
@@ -497,8 +533,16 @@ def prevalidate_catalog_drafts(
             state_text = str(state).strip()
             allowed_states_for_wit = states_by_wit.get(wit_norm)
             invalid_detail = ""
-            if wit_norm == "test case" and state_text.lower() in _TEST_CASE_INVALID_STATES:
-                invalid_detail = "Test Case does not allow State 'New'"
+            if (
+                allowed_states_for_wit is None
+                and wit_norm == "test case"
+                and state_text.lower() in _TEST_CASE_INVALID_STATES
+                and state_text.casefold() not in planned_by_wit.get(wit_norm, {})
+            ):
+                invalid_detail = (
+                    "Test Case has no State 'New' unless the Process step adds it "
+                    "(it does when Process Template runs)"
+                )
             elif allowed_states_for_wit and state_text.casefold() not in allowed_states_for_wit:
                 invalid_detail = (
                     f"'{draft.work_item_type}' supports: "
