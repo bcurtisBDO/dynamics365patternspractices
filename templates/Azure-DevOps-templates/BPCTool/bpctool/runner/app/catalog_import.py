@@ -37,6 +37,37 @@ class WorkItemDraft:
     warnings: list[str] = field(default_factory=list)
     # Set when another row already used this row's key; ``key`` was made unique.
     duplicate_of: str = ""
+    # The row's CATALOG_ID_COLUMNS values as written in the workbook.
+    catalog_ids: dict[str, str] = field(default_factory=dict)
+
+
+# Catalog columns added to every generated CSV that lists workbook rows, so each line can
+# be traced back to its catalog entry. Header in the CSV, then the workbook column name.
+# A CSV that already has one of these fields uses this header for it and doesn't repeat it.
+CATALOG_ID_COLUMNS = (
+    ("Catalog status MS BPC", "catalog status"),
+    ("Microsoft ID MS BPC", "microsoft id"),
+    ("Mavim ID MS BPC", "mavim id"),
+    ("Mavim reference MS BPC", "mavim reference"),
+    ("Partner ID MS BPC", "partner id"),
+)
+CATALOG_ID_HEADERS = [header for header, _ in CATALOG_ID_COLUMNS]
+CATALOG_STATUS_HEADER = "Catalog status MS BPC"
+MICROSOFT_ID_HEADER = "Microsoft ID MS BPC"
+
+
+def catalog_id_headers(*, without: tuple[str, ...] = ()) -> list[str]:
+    return [header for header in CATALOG_ID_HEADERS if header not in without]
+
+
+def catalog_id_values(draft: WorkItemDraft | None, *, without: tuple[str, ...] = ()) -> dict[str, str]:
+    """CSV header → the draft's catalog value ("" for rows not in the workbook)."""
+    ids = draft.catalog_ids if draft is not None else {}
+    return {header: ids.get(header, "") for header in catalog_id_headers(without=without)}
+
+
+def catalog_ids_by_key(drafts: Any) -> dict[str, dict[str, str]]:
+    return {draft.key: catalog_id_values(draft) for draft in drafts}
 
 
 def load_catalog_drafts(
@@ -113,12 +144,18 @@ def write_skipped_csv(skipped: list[SkippedDraft], path: Path) -> None:
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = SafeWriter(handle)
         writer.writerow(
-            ["Key", "Work item type", "Title", "Catalog status", "Why skipped", "Source file", "Source row"]
+            [
+                "Key", "Work item type", "Title", CATALOG_STATUS_HEADER, "Why skipped", "Source file", "Source row",
+                *catalog_id_headers(without=(CATALOG_STATUS_HEADER,)),
+            ]
         )
         for item in skipped:
             d = item.draft
             writer.writerow(
-                [d.key, d.work_item_type, d.title, catalog_status(d), item.reason, d.source_file, d.source_row]
+                [
+                    d.key, d.work_item_type, d.title, catalog_status(d), item.reason, d.source_file, d.source_row,
+                    *catalog_id_values(d, without=(CATALOG_STATUS_HEADER,)).values(),
+                ]
             )
 
 
@@ -139,9 +176,10 @@ def _drafts_from_workbook(
     headers = [_cell(v) for v in rows[header_idx]]
     drafts: list[WorkItemDraft] = []
     for offset, row in enumerate(rows[header_idx + 1 :], start=header_idx + 2):
-        values = {headers[i]: row[i] if i < len(row) else None for i in range(len(headers))}
-        if not any(v not in (None, "") for v in values.values()):
+        # Same blank-row rule as the catalog row counts in excel_ir.
+        if not any(_cell(v) for v in row):
             continue
+        values = {headers[i]: row[i] if i < len(row) else None for i in range(len(headers))}
         values["_source_file"] = path.name
         values["_source_sheet"] = sheet_name
         values["_source_row"] = offset
@@ -263,6 +301,7 @@ def _row_to_draft(
         hierarchy_level=hierarchy_level,
         content_formats=formats,
         markdown_format_fields=markdown_format_fields,
+        catalog_ids={header: _first_value(lookup, name) or "" for header, name in CATALOG_ID_COLUMNS},
     )
 
 
@@ -385,7 +424,7 @@ def _fill_title_hierarchy_parents(drafts: list[WorkItemDraft]) -> None:
 
 def _first_value(lookup: dict[str, Any], *keys: str) -> str | None:
     for key in keys:
-        value = lookup.get(normalize(key))
-        if value not in (None, ""):
-            return str(value).strip()
+        text = _cell(lookup.get(normalize(key)))
+        if text:
+            return text
     return None

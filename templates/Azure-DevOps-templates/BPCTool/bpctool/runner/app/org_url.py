@@ -7,7 +7,11 @@ from dataclasses import dataclass
 from urllib.parse import urlparse
 
 _BARE_ORG = re.compile(r"^[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?$")
-_VSSO_HOST = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9]\.visualstudio\.com$", re.I)
+_VSSO_HOST = re.compile(r"^[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?\.visualstudio\.com$", re.I)
+_INVALID_ORG = (
+    "URL must be https://dev.azure.com/{organization} or "
+    "https://{organization}.visualstudio.com"
+)
 _RESERVED_VSSO = {"app", "vssps", "vsaex", "pkgs", "feeds"}
 
 
@@ -34,7 +38,7 @@ def parse_ado_org_url(value: str) -> ParsedOrgUrl:
             raw = f"https://dev.azure.com/{raw}"
         elif raw.lower().startswith("dev.azure.com/"):
             raw = f"https://{raw}"
-        elif _VSSO_HOST.fullmatch(raw):
+        elif _VSSO_HOST.fullmatch(raw.split("/", 1)[0]):
             raw = f"https://{raw}"
         else:
             return ParsedOrgUrl(
@@ -59,6 +63,8 @@ def parse_ado_org_url(value: str) -> ParsedOrgUrl:
                 error="Org URL must include the organization after dev.azure.com.",
             )
         org = parts[0]
+        if not _BARE_ORG.fullmatch(org):
+            return ParsedOrgUrl(ok=False, error=_INVALID_ORG)
         return ParsedOrgUrl(
             ok=True,
             org=org,
@@ -67,14 +73,8 @@ def parse_ado_org_url(value: str) -> ParsedOrgUrl:
 
     if host.endswith(".visualstudio.com"):
         org = host[: -len(".visualstudio.com")]
-        if not org or "." in org or org.lower() in _RESERVED_VSSO:
-            return ParsedOrgUrl(
-                ok=False,
-                error=(
-                    "URL must be https://dev.azure.com/{organization} or "
-                    "https://{organization}.visualstudio.com"
-                ),
-            )
+        if not _BARE_ORG.fullmatch(org) or org in _RESERVED_VSSO:
+            return ParsedOrgUrl(ok=False, error=_INVALID_ORG)
         return ParsedOrgUrl(
             ok=True,
             org=org,

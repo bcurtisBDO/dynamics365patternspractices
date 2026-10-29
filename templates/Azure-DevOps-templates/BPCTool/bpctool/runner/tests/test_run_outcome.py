@@ -46,6 +46,39 @@ def test_outcome_explains_catalog_failures() -> None:
     assert item["examples"] == ["bpc.xlsx row 5 (k) — Area path 'X' does not exist in the project."]
 
 
+def test_unknown_outcome_creates_are_listed_once_with_the_rerun_fix() -> None:
+    from app.failure_explain import CATEGORY_TEXT
+
+    network_group = {"category": "network", "label": CATEGORY_TEXT["network"]["label"],
+                     "fix": CATEGORY_TEXT["network"]["fix"], "count": 2, "blockedChildren": 0, "examples": []}
+    catalog = {"drafts": 5, "created": 3, "failed": 2, "outcome_unknown": 2,
+               "failure_summary": {"total": 2, "rootCauses": 2, "blockedByParent": 0, "groups": [network_group]}}
+    outcome = build_outcome({"catalog": catalog}, dry_run=False, output_dir=None)
+    titles = [item["title"] for item in outcome["attention"]]
+    assert titles == ["2 rows: Network error — outcome unknown"]
+
+    # Without a failure group for them (e.g. an older summary), the item gives the same fix.
+    catalog["failure_summary"] = {}
+    outcome = build_outcome({"catalog": catalog}, dry_run=False, output_dir=None)
+    item = next(i for i in outcome["attention"] if "unknown outcome" in i["title"])
+    assert item["fix"] == CATEGORY_TEXT["network"]["fix"]
+    assert "duplicates" not in item["fix"]
+    assert "matched by their Microsoft ID" in item["fix"]
+
+
+def test_failed_setup_step_keeps_its_counts_and_shows_as_failed() -> None:
+    from app.run_outcome import describe_step
+
+    status, text = describe_step(
+        "layout",
+        {"wits_processed": 4, "controls": 30, "hidden_fields": 2, "warnings": 1, "error": "Layout step: 1 change failed"},
+        dry_run=False,
+    )
+    assert status == "error"
+    assert text.startswith("4 forms laid out with 30 controls (2 hidden fields).")
+    assert text.endswith("Then the step failed — see the error at the top.")
+
+
 def test_outcome_headline_says_when_catalog_problems_are_from_earlier_run() -> None:
     outcome = build_outcome(
         {"teams": {"teams": 2}, "catalog": _catalog_with_failures()},
@@ -124,6 +157,53 @@ def test_project_name_substitution_is_shown_in_outcome_and_html(tmp_path) -> Non
     ]
     html_text = (tmp_path / "rehearsal-summary.html").read_text(encoding="utf-8")
     assert 'class="notice"' in html_text and "Your Project Name Here" in html_text
+
+
+def test_outcome_reports_states_set_after_create_and_ones_that_failed() -> None:
+    catalog = {
+        "drafts": 3, "created": 3, "skipped": 0, "failed": 0,
+        "state_set_after_create": 2, "state_not_set": 1,
+        "state_not_set_examples": [{"key": "k", "workItemId": 9, "state": "New", "sourceFile": "bpc.xlsx",
+                                    "sourceRow": 4, "error": "TF401320"}],
+    }
+    outcome = build_outcome({"catalog": catalog}, dry_run=False, output_dir=None)
+    step = outcome["steps"][0]
+    assert "2 items created in the type's first state, then moved to its State" in step["summary"]
+    item = outcome["attention"][0]
+    assert item["severity"] == "warning" and item["count"] == 1
+    assert item["title"].startswith("1 item created but not moved to its State")
+    assert item["examples"] == ["bpc.xlsx row 4 (k, work item 9) — State 'New': TF401320"]
+
+
+def test_ado_links_use_the_canonical_org_and_encode_names() -> None:
+    from app.run_outcome import ado_links
+
+    links = ado_links("https://contoso.visualstudio.com/", project_name="BPC Demo", process_name="BPC & Co")
+    assert links == [
+        {"label": "Project", "url": "https://dev.azure.com/contoso/BPC%20Demo"},
+        {"label": "Boards", "url": "https://dev.azure.com/contoso/BPC%20Demo/_boards/board"},
+        {"label": "Work items", "url": "https://dev.azure.com/contoso/BPC%20Demo/_workitems"},
+        {"label": "Process settings", "url": "https://dev.azure.com/contoso/_settings/process?process-name=BPC%20%26%20Co"},
+    ]
+    assert ado_links("not a url", project_name="P", process_name="Q") == []
+
+
+def test_report_links_into_azure_devops(tmp_path) -> None:
+    outcome = write_run_summary(
+        _ir(), step_results={"teams": {"teams": 2}}, output_dir=tmp_path,
+        org_url="https://dev.azure.com/o", dry_run=False, run_id="r",
+    )
+    assert [link["label"] for link in outcome["adoLinks"]] == ["Project", "Boards", "Work items", "Process settings"]
+    page = (tmp_path / "bpc-ado-setup-summary.html").read_text(encoding="utf-8")
+    assert '<a href="https://dev.azure.com/o/Proj/_workitems" target="_blank" rel="noreferrer">Work items</a>' in page
+    assert "A rehearsal creates nothing" not in page
+
+    write_run_summary(
+        _ir(), step_results={}, output_dir=tmp_path, org_url="https://dev.azure.com/o", dry_run=True, run_id="r"
+    )
+    rehearsal = (tmp_path / "rehearsal-summary.html").read_text(encoding="utf-8")
+    assert "https://dev.azure.com/o/_settings/process?process-name=Proc" in rehearsal
+    assert "A rehearsal creates nothing" in rehearsal
 
 
 def test_rehearsal_writes_separate_summary(tmp_path) -> None:
@@ -301,6 +381,98 @@ def test_live_run_writes_summary_when_ado_check_fails(template_path, tmp_path, m
     assert result.outcome and result.outcome["status"] == "failed"
     assert (tmp_path / "contoso_Contoso-BPC" / "bpc-ado-setup-summary.html").is_file()
     assert any(event["type"] == "job-error" for event in events)
+
+
+class _ReadyTargets:
+    """Live client stand-in: process and project exist; records the project wait."""
+
+    waited: list[str] = []
+    cancel_wait = False
+
+    def __init__(self, *_args) -> None:
+        pass
+
+    def get_process_id(self, _name: str) -> str:
+        return "proc-guid"
+
+    def get_project_id(self, _name: str) -> str:
+        return "proj-guid"
+
+    def get_ready_project_id(self, _name: str, *, should_cancel=None, on_wait=None) -> str:
+        from app.ado_client import RunCancelled
+
+        if self.cancel_wait:
+            raise RunCancelled("Run cancelled by user while waiting for Azure DevOps to create project 'Contoso-BPC'.")
+        on_wait("createPending")
+        self.waited.append("ready")
+        return "proj-guid"
+
+    def require_multivalue_extension(self) -> None:
+        return None
+
+
+def _live_request(template_path, tmp_path):
+    from app.models import DryRunRequest
+
+    return DryRunRequest(
+        org_url="https://dev.azure.com/contoso",
+        process_name="Business Process Catalog",
+        project_name="Contoso-BPC",
+        excel_file=str(template_path),
+        output_root=str(tmp_path),
+        update_policy="always-update",
+    )
+
+
+@pytest.mark.parametrize("step", ["layout", "teams"])
+def test_step_setup_error_keeps_the_step_counts(template_path, tmp_path, monkeypatch, step) -> None:
+    from app import apply_engine
+    from app.writers.process import StepSetupError
+
+    stats = {"layout": {"wits_processed": 3, "controls": 12, "hidden_fields": 1, "warnings": 0},
+             "teams": {"teams": 2, "areas": 5, "assignments": 4, "warnings": 0}}[step]
+
+    def failing_step(*_args, **_kwargs):
+        raise StepSetupError(f"{step} step: 1 change(s) that later steps depend on failed", stats=dict(stats))
+
+    monkeypatch.setattr(apply_engine, "AdoClient", _ReadyTargets)
+    monkeypatch.setattr(apply_engine, f"apply_{step}", failing_step)
+    result = apply_engine.run_apply(_live_request(template_path, tmp_path), pat="x", dry_run=False, step_filter=[step])
+    assert not result.ok
+    kept = result.step_results[step]
+    assert {key: kept[key] for key in stats} == stats
+    assert "later steps depend on failed" in kept["error"]
+    card = next(s for s in result.outcome["steps"] if s["id"] == step)
+    assert card["status"] == "error"
+    assert ("3 forms laid out" if step == "layout" else "2 teams, 5 new area paths") in card["summary"]
+
+
+def test_live_run_waits_for_a_project_still_being_created(template_path, tmp_path, monkeypatch) -> None:
+    from app import apply_engine
+
+    monkeypatch.setattr(apply_engine, "AdoClient", _ReadyTargets)
+    monkeypatch.setattr(_ReadyTargets, "waited", [])
+    monkeypatch.setattr(apply_engine, "apply_teams", lambda *_a, **_k: {"teams": 1, "warnings": 0})
+    events: list[dict] = []
+    result = apply_engine.run_apply(
+        _live_request(template_path, tmp_path), pat="x", dry_run=False, step_filter=["teams"], emit=events.append
+    )
+    assert result.ok, result.error
+    assert _ReadyTargets.waited == ["ready"]
+    assert any("still being set up" in str(event.get("message")) for event in events)
+
+
+def test_cancel_while_waiting_for_the_project_cancels_the_run(template_path, tmp_path, monkeypatch) -> None:
+    from app import apply_engine
+
+    monkeypatch.setattr(apply_engine, "AdoClient", _ReadyTargets)
+    monkeypatch.setattr(_ReadyTargets, "cancel_wait", True)
+    result = apply_engine.run_apply(
+        _live_request(template_path, tmp_path), pat="x", dry_run=False, step_filter=["teams"],
+        should_cancel=lambda: True,
+    )
+    assert result.cancelled and not result.ok
+    assert result.outcome and result.outcome["status"] == "cancelled"
 
 
 def test_cancel_after_the_last_step_still_counts_as_finished(template_path, tmp_path) -> None:

@@ -26,6 +26,7 @@ import {
   cancelRunnerJob,
   pollRunnerJob,
   RUNNER_UNREACHABLE,
+  runnerErrorMessage,
   runnerFetch,
   runRunnerJob,
 } from './runnerApi'
@@ -37,6 +38,7 @@ import {
   resolveTargetSteps,
   runWorkflowFlow,
   stepExecutors,
+  stepsThatRan,
   workflowDefinitions,
 } from './workflowEngine'
 
@@ -205,7 +207,8 @@ function App() {
   const [pathPickerMode, setPathPickerMode] = useState('file')
   const [pathPickerTarget, setPathPickerTarget] = useState('template')
   const [workbookVersion, setWorkbookVersion] = useState('')
-  const [planResult, setPlanResult] = useState(null)
+  // { key, payload }: shown only while the plan inputs still match `key`.
+  const [planState, setPlanState] = useState(null)
   const [planLoading, setPlanLoading] = useState(false)
   const [planError, setPlanError] = useState('')
   const [updatePolicy, setUpdatePolicy] = useState('require-confirmation')
@@ -275,6 +278,7 @@ function App() {
   const activeJobIdRef = useRef(null)
   const runnerJobStartingRef = useRef(false)
   const pendingCancelRef = useRef(false)
+  const planRequestRef = useRef(0)
 
   const setOutputRootChoice = (value) => {
     setOutputRootChoiceState(value)
@@ -718,7 +722,9 @@ function App() {
       setExtensionMessage(`Could not verify Multivalue extension: ${message}`)
       return 'error'
     } finally {
-      setExtensionBusy(false)
+      if (generation === connectionGenRef.current) {
+        setExtensionBusy(false)
+      }
     }
   }
 
@@ -740,6 +746,9 @@ function App() {
       addLog('Installed DevLabs Multivalue control extension on organization.')
       return true
     } catch (error) {
+      if (generation !== connectionGenRef.current) {
+        return false
+      }
       const message =
         error instanceof Error ? error.message : 'Install failed'
       setExtensionStatus('missing')
@@ -753,17 +762,19 @@ function App() {
       }
       return false
     } finally {
-      setExtensionBusy(false)
+      if (generation === connectionGenRef.current) {
+        setExtensionBusy(false)
+      }
     }
   }
 
   /**
    * Gate process / layout / project runs on Multivalue extension presence.
    * Prompts to install when missing; blocks if declined or install fails.
-   * Skipped for Simulate and Rehearsal only (no ADO mutations; matches runner).
+   * Skipped for Simulate, API (read-only) and Rehearsal runs (no ADO mutations; matches runner).
    */
   const ensureMultivalueExtensionForSetup = async () => {
-    if (executionMode === 'simulate' || dryRun) {
+    if (executionMode === 'simulate' || executionMode === 'api' || dryRun) {
       return true
     }
     if (!stepsRequireMultivalueExtension(plannedStepIds)) {
@@ -1076,12 +1087,15 @@ function App() {
 
   /** keepRunnerJob: the job may still be running, so a reload can reattach to it. */
   const endRun = ({ keepRunnerJob = false } = {}) => {
+    const ownJobId = activeJobIdRef.current
     isRunningRef.current = false
     abortControllerRef.current = null
     activeJobIdRef.current = null
     runnerJobStartingRef.current = false
     pendingCancelRef.current = false
-    if (!keepRunnerJob) {
+    // A run that never created/attached a job (409, Simulate, API) must keep an older
+    // still-running job reattachable.
+    if (!keepRunnerJob && ownJobId && readActiveRunnerJob()?.jobId === ownJobId) {
       writeSession(SESSION_ACTIVE_RUNNER_JOB, '')
     }
     setIsRunning(false)
@@ -1174,7 +1188,7 @@ function App() {
       logRunTiming(timings, totalMs, { failed: !applyOk })
     }
     const timingNote = totalMs != null ? ` Total ${formatDurationMs(totalMs)}.` : ''
-    const finished = Object.keys(job.apply_result?.step_results || {})
+    const finished = stepsThatRan(job.apply_result?.step_results)
     const outcome = job.apply_result?.outcome ?? null
     setRunOutcome(outcome)
     const resultsNote = outcome ? ' See the results below.' : ''
@@ -1302,6 +1316,23 @@ function App() {
     setPathPickerOpen(true)
   }
 
+  const planRequestBody = JSON.stringify({
+    org_url: effectiveOrgUrl,
+    process_name: processName.trim(),
+    project_name: projectName.trim(),
+    excel_file: templatePath.trim(),
+    catalog_source_dir: catalogSourceDir.trim() || null,
+    workbook_version: workbookVersion.trim(),
+    update_policy: updatePolicy,
+    confirm_process_update: confirmProcessUpdate,
+    confirm_project_update: confirmProjectUpdate,
+    known_process_exists: processesFetched ? targetAssessment.process.exists : null,
+    known_project_exists: projectsFetched ? targetAssessment.project.exists : null,
+    root_area_path: rootAreaPath.trim() || projectName.trim(),
+    include_deprecated_deleted: includeDeprecatedDeleted,
+  })
+  const planResult = planState?.key === planRequestBody ? planState.payload : null
+
   const previewPlan = async () => {
     if (!connectionReady) {
       setPlanError('Set org URL and PAT in Connection first.')
@@ -1312,38 +1343,30 @@ function App() {
       return
     }
 
+    planRequestRef.current += 1
+    const request = planRequestRef.current
+    const body = planRequestBody
     setPlanLoading(true)
     setPlanError('')
-    setPlanResult(null)
+    setPlanState(null)
     setRunMessage('Building plan preview from the workbooks (no Azure DevOps changes)...')
 
     try {
       const response = await runnerFetch('/api/plan/dry-run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          org_url: effectiveOrgUrl,
-          process_name: processName.trim(),
-          project_name: projectName.trim(),
-          excel_file: templatePath.trim(),
-          catalog_source_dir: catalogSourceDir.trim() || null,
-          workbook_version: workbookVersion.trim(),
-          update_policy: updatePolicy,
-          confirm_process_update: confirmProcessUpdate,
-          confirm_project_update: confirmProjectUpdate,
-          known_process_exists: processesFetched ? targetAssessment.process.exists : null,
-          known_project_exists: projectsFetched ? targetAssessment.project.exists : null,
-          root_area_path: rootAreaPath.trim() || projectName.trim(),
-          include_deprecated_deleted: includeDeprecatedDeleted,
-        }),
+        body,
       })
 
       const payload = await response.json().catch(() => ({}))
+      if (request !== planRequestRef.current) {
+        return
+      }
       if (!response.ok) {
-        throw new Error(payload.detail || `Runner error (${response.status})`)
+        throw new Error(runnerErrorMessage(payload, response.status))
       }
 
-      setPlanResult(payload)
+      setPlanState({ key: body, payload })
       setRunMessage(
         payload.ok
           ? `Plan ready: ${payload.actions?.length ?? 0} actions from ${payload.summary?.counts?.catalog_rows ?? 0} catalog rows.`
@@ -1355,6 +1378,9 @@ function App() {
         }`,
       )
     } catch (error) {
+      if (request !== planRequestRef.current) {
+        return
+      }
       const message =
         error instanceof Error
           ? error.message
@@ -1362,7 +1388,9 @@ function App() {
       setPlanError(message)
       setRunMessage(`Plan preview failed: ${message}`)
     } finally {
-      setPlanLoading(false)
+      if (request === planRequestRef.current) {
+        setPlanLoading(false)
+      }
     }
   }
 
@@ -1378,6 +1406,11 @@ function App() {
 
     if (!nameValidation.ok) {
       setRunMessage(`Name/policy validation failed: ${nameValidation.messages.join(' ')}`)
+      return
+    }
+
+    if (plannedStepIds.length === 0) {
+      setRunMessage(`Nothing to run. ${runPlanLabel}`)
       return
     }
 
@@ -1473,7 +1506,7 @@ function App() {
             rootAreaPath: runConfig.rootAreaPath,
             mode: 'apply',
             applyDryRun: dryRun,
-            steps: plannedSteps.length ? plannedSteps : null,
+            steps: plannedSteps,
             convertMarkdownToHtml,
             includeDeprecatedDeleted,
             catalogParallelWorkers: parseBoundedInt(threads, 4),
@@ -1819,6 +1852,7 @@ function App() {
           <label className="radio-row">
             <input
               type="radio"
+              name="run-mode"
               checked={runMode === 'step'}
               onChange={() => setRunMode('step')}
               disabled={isRunning}
@@ -1828,6 +1862,7 @@ function App() {
           <label className="radio-row">
             <input
               type="radio"
+              name="run-mode"
               checked={runMode === 'single'}
               onChange={() => setRunMode('single')}
               disabled={isRunning}
@@ -1837,6 +1872,7 @@ function App() {
           <label className="radio-row">
             <input
               type="radio"
+              name="run-mode"
               checked={runMode === 'from'}
               onChange={() => setRunMode('from')}
               disabled={isRunning}
@@ -1846,6 +1882,7 @@ function App() {
           <label className="radio-row">
             <input
               type="radio"
+              name="run-mode"
               checked={runMode === 'full'}
               onChange={() => setRunMode('full')}
               disabled={isRunning}
@@ -2179,7 +2216,8 @@ function App() {
               isRunning ||
               runStarting ||
               !connectionReady ||
-              !nameValidation.ok
+              !nameValidation.ok ||
+              plannedStepIds.length === 0
             }
           >
             {isRunning ? 'Running...' : runButtonLabel}

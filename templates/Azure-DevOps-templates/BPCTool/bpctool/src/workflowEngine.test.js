@@ -4,6 +4,7 @@ import {
   migrateCompletedStepIds,
   resolveTargetSteps,
   runWorkflowFlow,
+  stepsThatRan,
   validateRunnerConfig,
   workflowDefinitions,
 } from './workflowEngine'
@@ -42,6 +43,26 @@ describe('migrateCompletedStepIds', () => {
       'project',
       'layout',
     ])
+  })
+})
+
+describe('stepsThatRan', () => {
+  it('drops steps the runner skipped by plan/policy or that failed', () => {
+    expect(
+      stepsThatRan({
+        process: { skipped: true, duration_ms: 0 },
+        layout: { updated: 3, duration_ms: 40 },
+        catalog: { skipped: true, reason: 'no catalog rows' },
+        report: { files: ['report.html'], duration_ms: 5 },
+        backlog: { error: 'boom', duration_ms: 1 },
+      }),
+    ).toEqual(['layout', 'report'])
+  })
+
+  it('handles missing results', () => {
+    expect(stepsThatRan(undefined)).toEqual([])
+    expect(stepsThatRan(null)).toEqual([])
+    expect(stepsThatRan({ project: null })).toEqual(['project'])
   })
 })
 

@@ -8,6 +8,7 @@
  * is left alone.
  */
 import { execSync, spawn } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
 import http from 'node:http'
 import path from 'node:path'
@@ -94,9 +95,14 @@ function runSetup(logger = console) {
   })
 }
 
-/** Resolves once the runner answers /health; rejects early if `child` exits first. */
-export function waitForHealth(child, { url = HEALTH, timeoutMs = 20000 } = {}) {
+/**
+ * Resolves once the runner answers /health; rejects early if `child` exits first. With `instance`,
+ * only a runner reporting that BPCTOOL_RUNNER_INSTANCE counts: an older runner still holding the
+ * port also answers /health, and the new one then exits because it can't bind.
+ */
+export function waitForHealth(child, { url = HEALTH, timeoutMs = 20000, instance = null } = {}) {
   const started = Date.now()
+  let otherRunner = false
   return new Promise((resolve, reject) => {
     let done = false
     const finish = (error) => {
@@ -113,8 +119,11 @@ export function waitForHealth(child, { url = HEALTH, timeoutMs = 20000 } = {}) {
     const onExit = () =>
       finish(
         new Error(
-          'The Python runner stopped while starting (see the [bpc-runner] lines above). ' +
-            'Close BPCTool and double-click "Start BPCTool" to repair the setup, or run: npm run setup',
+          otherRunner
+            ? `An older BPCTool runner is still using port ${new URL(url).port}, so the new one ` +
+                'could not start. Close every BPCTool window (or restart the computer), then start BPCTool again.'
+            : 'The Python runner stopped while starting (see the [bpc-runner] lines above). ' +
+                'Close BPCTool and double-click "Start BPCTool" to repair the setup, or run: npm run setup',
         ),
       )
     child.once('exit', onExit)
@@ -123,12 +132,22 @@ export function waitForHealth(child, { url = HEALTH, timeoutMs = 20000 } = {}) {
     const tick = () => {
       if (done) return
       const req = http.get(url, (res) => {
-        res.resume()
-        if (res.statusCode === 200) {
-          finish()
-          return
-        }
-        retry()
+        let body = ''
+        res.setEncoding('utf8')
+        res.on('data', (chunk) => {
+          body += chunk
+        })
+        res.on('end', () => {
+          if (res.statusCode !== 200) {
+            retry()
+          } else if (instance === null || runnerInstance(body) === instance) {
+            finish()
+          } else {
+            otherRunner = true
+            retry()
+          }
+        })
+        res.on('error', retry)
       })
       req.on('error', retry)
       req.setTimeout(1000, () => {
@@ -139,13 +158,46 @@ export function waitForHealth(child, { url = HEALTH, timeoutMs = 20000 } = {}) {
     const retry = () => {
       if (done) return
       if (Date.now() - started > timeoutMs) {
-        finish(new Error(`Local runner did not become healthy on ${url}`))
+        finish(
+          new Error(
+            otherRunner
+              ? `Local runner did not become healthy on ${url} (an older runner is still answering there)`
+              : `Local runner did not become healthy on ${url}`,
+          ),
+        )
         return
       }
       setTimeout(tick, 250)
     }
     tick()
   })
+}
+
+function runnerInstance(body) {
+  try {
+    return JSON.parse(body)?.instance ?? null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * PIDs listening on `port` in `netstat -ano` output. Columns are protocol, local address, remote
+ * address, state, PID; the state text is localized, so a listener is recognised by its remote
+ * port 0 (0.0.0.0:0 / [::]:0).
+ */
+export function listeningPids(output, port = PORT) {
+  const pids = new Set()
+  for (const line of String(output || '').split(/\r?\n/)) {
+    const columns = line.trim().split(/\s+/)
+    if (columns.length < 5 || columns[0].toUpperCase() !== 'TCP') continue
+    const [, local, remote] = columns
+    const pid = columns.at(-1)
+    if (local.endsWith(`:${port}`) && remote.endsWith(':0') && /^[1-9]\d*$/.test(pid)) {
+      pids.add(pid)
+    }
+  }
+  return [...pids]
 }
 
 /**
@@ -207,17 +259,11 @@ function probeListener() {
 function freeRunnerPort(logger = console) {
   try {
     if (process.platform === 'win32') {
-      const out = execSync(`netstat -ano | findstr :${PORT}`, {
+      const out = execSync('netstat -ano', {
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'ignore'],
       })
-      const pids = new Set()
-      for (const line of out.split(/\r?\n/)) {
-        if (!line.includes('LISTENING')) continue
-        const pid = line.trim().split(/\s+/).pop()
-        if (pid && /^\d+$/.test(pid)) pids.add(pid)
-      }
-      for (const pid of pids) {
+      for (const pid of listeningPids(out)) {
         try {
           execSync(`taskkill /PID ${pid} /T /F`, { stdio: 'ignore' })
           logger.info?.(`[bpc-runner] Stopped stale process PID ${pid} on :${PORT}`)
@@ -335,6 +381,9 @@ export function localRunnerPlugin() {
     // --reload restarts the runner on any code change, killing a run in progress (e.g. a
     // git pull mid-import), so only `npm run dev` uses it.
     const reload = process.env.npm_lifecycle_event === 'dev'
+    // Not the child's PID: on Windows the venv python.exe is a launcher, and --reload serves from
+    // a worker process, so /health reports a different PID than the one spawned here.
+    const instance = randomUUID()
     logger.info?.(
       `[bpc-runner] Starting ${python} -m uvicorn on ${HOST}:${PORT}${reload ? ' (--reload)' : ''}`,
     )
@@ -353,7 +402,7 @@ export function localRunnerPlugin() {
       {
         cwd: RUNNER_DIR,
         stdio: ['ignore', 'pipe', 'pipe'],
-        env: runnerEnv(logger),
+        env: { ...runnerEnv(logger), BPCTOOL_RUNNER_INSTANCE: instance },
       },
     )
     child = runner
@@ -394,7 +443,7 @@ export function localRunnerPlugin() {
       }
     })
 
-    await waitForHealth(runner)
+    await waitForHealth(runner, { instance })
     logger.info?.('[bpc-runner] Ready.')
   }
 

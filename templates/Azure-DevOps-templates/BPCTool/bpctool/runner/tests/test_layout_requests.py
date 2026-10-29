@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from app.ado_client import AdoError
 from app.writers.layout import apply_layout
+from app.writers.process import StepSetupError
 
 WIT_REF = "BPC.Workshop"
 
@@ -155,15 +158,24 @@ def test_boolean_field_tries_fallback_payloads_after_a_400() -> None:
     assert not any("Add boolean field" in message for message in events)
 
 
-def test_field_rejected_with_400_is_reported_not_treated_as_present() -> None:
+def test_field_rejected_with_400_fails_the_step_after_the_rest() -> None:
     client = CountingLayoutClient(wit_fields=[], controls=[], reject_field_posts=1)
-    stats, events = _run(client, _ir([_field(1)]))
+    events: list[str] = []
+    with pytest.raises(StepSetupError) as caught:
+        apply_layout(
+            client,  # type: ignore[arg-type]
+            _ir([_field(1), _field(2)]),
+            dry_run=False,
+            emit=lambda _step, message: events.append(message),
+            process_id="proc-1",
+        )
 
-    assert len(client.field_posts) == 1
-    assert stats["fields_added"] == 0
-    assert stats["warnings"] == 1
-    assert client.control_posts == []
+    assert [body["referenceName"] for body in client.field_posts] == ["MSBPC.field1", "MSBPC.field2"]
+    assert client.control_posts == ["MSBPC.field2"]
     assert any("Add field MSBPC.field1" in message for message in events)
+    assert "Layout step: 1 change(s)" in str(caught.value)
+    assert "field MSBPC.field1 couldn't be added to 'Workshop'" in str(caught.value)
+    assert caught.value.stats["fields_added"] == 1
 
 
 class RejectingLayoutClient(CountingLayoutClient):

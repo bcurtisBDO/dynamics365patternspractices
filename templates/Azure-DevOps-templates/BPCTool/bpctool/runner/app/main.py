@@ -11,9 +11,17 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from starlette.datastructures import Headers
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .excel_ir import build_ir, find_template_workbook
-from .fs_browser import NETWORK_PATH_ERROR, is_network_path, list_directory, list_roots
+from .fs_browser import (
+    NETWORK_PATH_ERROR,
+    is_network_path,
+    list_directory,
+    list_roots,
+    unreadable_file_message,
+)
 from .jobs import (
     ApplyInProgressError,
     active_job_count,
@@ -32,9 +40,51 @@ app = FastAPI(
     version="0.2.0",
 )
 
+_STATE_CHANGING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+# The Vite proxy passes the browser's Origin through unchanged (changeOrigin only rewrites
+# Host), and its port moves on when 5173 is taken.
+_LOCAL_ORIGIN = re.compile(r"https?://(?:localhost|127\.0\.0\.1|\[::1\])(?::\d{1,5})?", re.I)
+
+
+def _refuse_write(headers: Headers) -> JSONResponse | None:
+    origin = headers.get("origin")
+    if origin is not None and not _LOCAL_ORIGIN.fullmatch(origin.strip()):
+        return JSONResponse(status_code=403, content={"detail": "Cross-site request refused."})
+    if headers.get("sec-fetch-site", "").strip().lower() == "cross-site":
+        return JSONResponse(status_code=403, content={"detail": "Cross-site request refused."})
+    length = headers.get("content-length", "").strip()
+    has_body = "transfer-encoding" in headers or length not in {"", "0"}
+    media_type = headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if has_body and media_type != "application/json":
+        return JSONResponse(
+            status_code=415, content={"detail": "Request body must be application/json."}
+        )
+    return None
+
+
+class LocalWritesOnly:
+    """Refuse state-changing requests a web page on another site could send.
+
+    Browsers send "simple" cross-site POSTs (text/plain, no preflight) without CORS, so
+    the Host check alone doesn't stop a page from starting a run.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http" and scope["method"] in _STATE_CHANGING_METHODS:
+            refusal = _refuse_write(Headers(scope=scope))
+            if refusal is not None:
+                await refusal(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
 # No CORS: the UI reaches the runner through the Vite /api proxy, so web pages on other
 # origins cannot read runner responses. The Host check blocks DNS-rebinding pages.
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost"])
+app.add_middleware(LocalWritesOnly)
 
 
 @app.exception_handler(RequestValidationError)
@@ -72,6 +122,9 @@ def health() -> dict[str, str | int]:
         "teams_writer_mtime": _mtime("teams.py"),
         "backlog_writer_mtime": _mtime("backlog.py"),
         "active_jobs": active_job_count(),
+        "pid": os.getpid(),
+        # Set by the launcher for the runner it started, so it can tell it from a stale one.
+        "instance": os.environ.get("BPCTOOL_RUNNER_INSTANCE", ""),
     }
 
 
@@ -118,6 +171,8 @@ def dry_run(request: DryRunRequest) -> DryRunResponse:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=unreadable_file_message(exc)) from exc
 
 
 @app.post("/ir/parse")
@@ -134,6 +189,8 @@ def parse_ir(request: DryRunRequest) -> dict:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=unreadable_file_message(exc)) from exc
 
 
 _OUTPUT_LINK_RE = re.compile(
@@ -179,6 +236,8 @@ def post_job(request: JobCreateRequest) -> JobStatusResponse:
         return create_job(request)
     except ApplyInProgressError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=unreadable_file_message(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

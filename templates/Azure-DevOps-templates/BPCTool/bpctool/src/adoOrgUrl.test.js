@@ -36,11 +36,35 @@ describe('parseAdoOrgUrl', () => {
     expect(parseAdoOrgUrl('https://app.visualstudio.com').ok).toBe(false)
     expect(parseAdoOrgUrl('https://vssps.visualstudio.com').ok).toBe(false)
   })
+
+  it('rejects a dev.azure.com path whose first segment is not an org name', () => {
+    expect(parseAdoOrgUrl('https://dev.azure.com/_apis/x').ok).toBe(false)
+    expect(parseAdoOrgUrl('dev.azure.com/_apis').ok).toBe(false)
+    expect(parseAdoOrgUrl('https://dev.azure.com/-contoso').ok).toBe(false)
+    expect(parseAdoOrgUrl('https://dev.azure.com/con%20toso').ok).toBe(false)
+    expect(parseAdoOrgUrl('https://dev.azure.com/contoso-2/_apis').org).toBe('contoso-2')
+  })
+
+  it('accepts schemeless visualstudio.com URLs with a path', () => {
+    expect(parseAdoOrgUrl('contoso.visualstudio.com/').org).toBe('contoso')
+    expect(parseAdoOrgUrl('contoso.visualstudio.com/DefaultCollection').canonicalUrl).toBe(
+      'https://dev.azure.com/contoso',
+    )
+    expect(parseAdoOrgUrl('app.visualstudio.com/').ok).toBe(false)
+  })
 })
 
 describe('normalizeAdoOrgUrl', () => {
   it('preserves visualstudio host style for display/profiles', () => {
     expect(normalizeAdoOrgUrl('https://contoso.visualstudio.com/extra')).toEqual({
+      ok: true,
+      url: 'https://contoso.visualstudio.com',
+    })
+    expect(normalizeAdoOrgUrl('contoso.visualstudio.com/')).toEqual({
+      ok: true,
+      url: 'https://contoso.visualstudio.com',
+    })
+    expect(normalizeAdoOrgUrl('contoso.visualstudio.com/DefaultCollection')).toEqual({
       ok: true,
       url: 'https://contoso.visualstudio.com',
     })

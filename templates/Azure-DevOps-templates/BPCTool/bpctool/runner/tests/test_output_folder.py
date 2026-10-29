@@ -107,6 +107,33 @@ def test_this_projects_folder_with_another_projects_id_map_stops_catalog_import(
     assert settled == folder and messages[0].startswith("Warning:")
 
 
+class MixedReader(BatchReader):
+    """Even work item ids live in ``project``, odd ones in ``other``."""
+
+    def __init__(self, project: str, other: str) -> None:
+        super().__init__(project)
+        self.other = other
+
+    def get_work_items_batch(self, project: str, ids: list[int]) -> list[dict[str, Any]]:
+        self.calls.append((project, ids))
+        return [{"id": i, "fields": {"System.TeamProject": self.project if i % 2 == 0 else self.other}} for i in ids]
+
+
+@pytest.mark.parametrize("owned", [True, False])
+def test_an_id_map_mixing_this_project_with_another_is_never_claimed(tmp_path: Path, owned: bool) -> None:
+    folder = _with_id_map(default_output_dir(ORG, "Finance Team", str(tmp_path)))
+    if owned:
+        (folder / TARGET_FILE).write_text('{"organization": "contoso", "project": "Finance Team"}', encoding="utf-8")
+    reader = MixedReader("Finance Team", "Finance_Team")
+
+    with pytest.raises(AdoError, match="several projects \\('Finance Team' and 'Finance_Team'\\)"):
+        _settle(folder, reader, "Finance Team", tmp_path)
+    settled, messages = _settle(folder, reader, "Finance Team", tmp_path, catalog=False)
+
+    assert settled == folder and messages[0].startswith("Warning:")
+    assert (folder / TARGET_FILE).exists() is owned
+
+
 def test_an_id_map_whose_items_no_longer_exist_stops_catalog_import(tmp_path: Path) -> None:
     folder = _with_id_map(default_output_dir(ORG, "Finance Team", str(tmp_path)))
 

@@ -53,7 +53,7 @@ class FakeReader:
     def get_project_id(self, _name: str) -> str:
         return "project-guid"
 
-    def get_work_items_batch(self, _project: str, ids: list[int]) -> list[dict]:
+    def get_work_items_batch(self, _project: str, ids: list[int], **_kw) -> list[dict]:
         self.batches.append(list(ids))
         return [{"id": i, "fields": self.items[i]} for i in ids if i in self.items]
 
@@ -62,6 +62,13 @@ class FakeReader:
             i for i, fields in self.items.items()
             if fields.get("System.WorkItemType") == wit and fields.get(field_ref)
         ]
+
+    def has_work_item_with_field(self, _project: str, field_ref: str) -> bool:
+        return any(fields.get(field_ref) for fields in self.items.values())
+
+    def find_work_items_by_field_values(self, _project: str, field_ref: str, values: list[str]) -> list[int]:
+        wanted = {v.casefold() for v in values}
+        return [i for i, fields in self.items.items() if str(fields.get(field_ref) or "").casefold() in wanted]
 
 
 def _compare(reader, drafts, id_map, **kwargs):
@@ -155,13 +162,15 @@ def test_csv_opens_in_excel_with_plain_columns(tmp_path) -> None:
     reader = FakeReader({1: {"System.Title": "Old", "System.WorkItemType": "Process"}})
     changes = _compare(reader, [_draft("A", {"System.Title": "New"})], _id_map(("A", 1)))
     path = tmp_path / "changes.csv"
-    write_changes_csv(changes, path)
+    write_changes_csv(changes, path, catalog_ids={"A": {"Microsoft ID MS BPC": "MS-A", "Mavim ID MS BPC": "M-1"}})
     assert path.read_bytes().startswith(b"\xef\xbb\xbf")
     rows = list(csv.DictReader(path.open(encoding="utf-8-sig")))
     assert rows == [{
         "Change": "Field value differs", "Key": "A", "Work item ID": "1", "Work item type": "Process",
         "Title": "New", "Field": "Title", "Value in Azure DevOps": "Old", "Value in workbook": "New",
         "Usually edited in": "Workbook", "Source file": "bpc.xlsx", "Source row": "7",
+        "Catalog status MS BPC": "", "Microsoft ID MS BPC": "MS-A", "Mavim ID MS BPC": "M-1",
+        "Mavim reference MS BPC": "", "Partner ID MS BPC": "",
     }]
 
 
@@ -227,9 +236,11 @@ def test_project_without_id_map_is_matched_by_microsoft_id(tmp_path) -> None:
     for row in rows:
         by_change.setdefault(row["Change"], []).append(row)
     duplicate_ids = {r["Work item ID"] for r in by_change[
-        "Already in Azure DevOps, not in ado-id-map.csv — a live run would create a duplicate"]}
+        "Already in Azure DevOps, not in ado-id-map.csv — a live run adds it to the map instead of creating it"]}
     assert duplicate_ids == {"10", "11"}
-    assert by_change["Several work items in Azure DevOps match this row"][0]["Value in Azure DevOps"] == "#12, #13"
+    several = by_change["Several work items in Azure DevOps match this row — a live run doesn't create it"]
+    assert several[0]["Value in Azure DevOps"] == "#12, #13"
+    assert summary["wouldCreate"] == 1
     changed = {(r["Field"], r["Value in Azure DevOps"], r["Value in workbook"]) for r in by_change["Field value differs"]}
     assert changed == {("Title", "Old title", "New title"), ("MSBPC.processsequenceid", "9.9", "1.2")}
     assert {r["Key"] for r in by_change["In Azure DevOps, not in the workbook"]} == {""}
@@ -239,11 +250,49 @@ def test_project_without_id_map_is_matched_by_microsoft_id(tmp_path) -> None:
         "No ado-id-map.csv in this output folder, so workbook rows were matched to the project's "
         "work items by Microsoft ID: 2 of 4 rows matched. 1 item differs from the workbook"
     )
-    assert "creates every row" in outcome["changes"]["note"]
-    warning = outcome["attention"][0]
-    assert warning["title"] == "2 rows already in Azure DevOps would be created again"
-    assert warning["file"] == "import-changes.csv"
-    assert "2 rows would be created again" in outcome["subline"]
+    assert "matched by Microsoft ID and added to ado-id-map.csv" in outcome["changes"]["note"]
+    warning, info = outcome["attention"][:2]
+    assert warning["severity"] == "warning" and warning["title"] == "1 row matches several work items in Azure DevOps"
+    assert info["severity"] == "info"
+    assert info["title"] == "2 rows already in Azure DevOps but not in ado-id-map.csv"
+    assert info["file"] == "import-changes.csv"
+    assert "2 rows already in Azure DevOps would be reused" in outcome["subline"]
+
+
+def test_rows_under_a_row_with_several_matches_are_blocked_not_new(tmp_path) -> None:
+    def item(microsoft_id, title):
+        return {"System.WorkItemType": "Process", "System.Title": title, "MSBPC.microsoftid": microsoft_id}
+
+    reader = FakeReader({12: item("M3", "Twin"), 13: item("M3", "Twin"), 20: item("M7", "Kept")})
+    drafts = [
+        _draft("P", {"MSBPC.microsoftid": "M3"}),
+        _draft("C", {"MSBPC.microsoftid": "M5"}, parent="P"),
+        _draft("G", {}, parent="C"),
+        _draft("K", {"System.Title": "Kept", "MSBPC.microsoftid": "M7"}, parent="P"),
+        _draft("L", {}, parent="K"),
+        _draft("N", {}),
+    ]
+    summary = _write_change_report(
+        reader, drafts, [], _mapping(), project="Proj", output_dir=tmp_path, workers=2,
+        emit=lambda *_: None, run_id="r1", complete_workbook=True, project_lookup={"exists": True},
+    )
+    kinds = summary["byKind"]
+    assert kinds["ambiguous_match"] == 1
+    # C and G (any depth) wait on P; L's parent K is already in Azure DevOps, so L is created.
+    assert kinds["blocked_by_ambiguous_parent"] == 2
+    assert kinds["new_row"] == 2 and summary["wouldCreate"] == 2
+    rows = list(csv.DictReader((tmp_path / CHANGES_CSV).open(encoding="utf-8-sig")))
+    blocked = [r for r in rows if r["Change"].startswith("Under a row that matches several work items")]
+    assert {(r["Key"], r["Field"], r["Value in workbook"]) for r in blocked} == {
+        ("C", "Blocked by", "P"),
+        ("G", "Blocked by", "P"),
+    }
+
+    outcome = build_outcome({"catalog": {"drafts": 6, "skipped": 4, "changes": summary}}, dry_run=True, output_dir=None)
+    several = next(a for a in outcome["attention"] if "several work items" in a["title"])
+    assert "2 rows under it wait too and are not created either." in several["detail"]
+    assert several["count"] == 3
+    assert "2 rows are under a row that matches several work items" in " ".join(outcome["changes"]["items"])
 
 
 def test_project_lookup_is_direct_and_404_means_missing(monkeypatch) -> None:
@@ -294,7 +343,7 @@ def test_rehearsal_catalog_step_compares_real_workbook(template_path, tmp_path, 
             self.gets.append(path)
             return {}
 
-        def get_work_items_batch(self, project: str, ids: list[int]) -> list[dict]:
+        def get_work_items_batch(self, project: str, ids: list[int], **_kw) -> list[dict]:
             # "" = the organization-level check of which project ado-id-map.csv belongs to.
             assert project in {"Contoso-BPC", ""}
             return [
@@ -386,6 +435,7 @@ def test_read_only_client_refuses_writes(monkeypatch) -> None:
         ("PATCH", "/_apis/wit/workitems/1"),
         ("DELETE", "/_apis/wit/workitems/1"),
         ("POST", "/_apis/wiql"),
+        ("POST", "/_apis/wit/$batch"),
     ]:
         with pytest.raises(AdoError, match="read-only"):
             client.request(method, path, project="Proj")

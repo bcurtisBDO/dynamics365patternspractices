@@ -5,6 +5,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from .fs_browser import NETWORK_PATH_ERROR, is_network_path
+
 ENGINE_STEPS = ("process", "layout", "project", "teams", "backlog", "catalog", "report")
 
 
@@ -94,6 +96,13 @@ class DryRunRequest(BaseModel):
                 f"Unknown step(s): {', '.join(unknown)}. Valid steps: {', '.join(ENGINE_STEPS)}."
             )
         return [step for step in ENGINE_STEPS if step in steps]
+
+    @field_validator("excel_file", "catalog_source_dir", "output_root")
+    @classmethod
+    def _no_network_paths(cls, value: str | None) -> str | None:
+        if value and is_network_path(value):
+            raise ValueError(NETWORK_PATH_ERROR)
+        return value
 
     @field_validator("output_root")
     @classmethod

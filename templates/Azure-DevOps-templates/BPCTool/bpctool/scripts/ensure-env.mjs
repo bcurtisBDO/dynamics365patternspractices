@@ -44,16 +44,26 @@ export function pythonVersionSupported(version) {
   return major > PYTHON_MIN[0] || (major === PYTHON_MIN[0] && minor >= PYTHON_MIN[1])
 }
 
-/** Hash of the files an install depends on; missing files hash as empty. */
-export function installStamp(files) {
+/** Hash of the files an install depends on (missing files hash as empty) and `extra`. */
+export function installStamp(files, extra = '') {
   const digest = createHash('sha256')
   for (const file of files) {
     digest.update(`${path.basename(file)}\0`)
     digest.update(existsSync(file) ? readFileSync(file) : '')
     digest.update('\0')
   }
+  digest.update(extra)
   return digest.digest('hex')
 }
+
+/**
+ * `python -m venv` arguments. A venv whose base Python was removed or upgraded can't start, and
+ * without --clear venv keeps its dangling interpreter links (and the old pip stamp).
+ */
+export const venvCreateArgs = (venvExists) => ['-m', 'venv', ...(venvExists ? ['--clear'] : []), '.venv']
+
+/** Packages are tied to the interpreter they were installed for. */
+export const pipStampExtra = (venvPythonInfo) => `${venvPythonInfo.executable}\0${venvPythonInfo.version}`
 
 const readStamp = (file) => {
   try {
@@ -195,26 +205,35 @@ function main() {
     console.log('[setup] npm dependencies up to date.')
   }
 
-  if (!existsSync(venvPython)) {
+  let venv = existsSync(venvPython) ? probePython([venvPython]) : null
+  if (!venv) {
     const python = resolvePython()
-    console.log(`[setup] Creating Python venv with ${python.version} (${python.executable})...`)
+    const rebuild = existsSync(venvDir)
+    if (rebuild) {
+      console.log('[setup] The Python venv no longer starts (was its Python removed or upgraded?).')
+    }
+    console.log(
+      `[setup] ${rebuild ? 'Recreating' : 'Creating'} Python venv with ${python.version} (${python.executable})...`,
+    )
     run(
       python.executable,
-      ['-m', 'venv', '.venv'],
+      venvCreateArgs(rebuild),
       'Reinstall Python 3 from python.org, then start BPCTool again.',
     )
-  } else {
-    const python = probePython([venvPython])
-    if (python && !pythonVersionSupported(python.version)) {
-      fail(
-        `The runner venv uses ${python.version}; BPCTool needs Python ${PYTHON_MIN.join('.')}+. ` +
-          `Install a newer Python 3, delete the folder ${venvDir}, then start BPCTool again.`,
-      )
+    venv = probePython([venvPython])
+    if (!venv) {
+      fail(`The new Python venv does not start. Delete the folder ${venvDir}, then start BPCTool again.`)
     }
+  } else if (!pythonVersionSupported(venv.version)) {
+    fail(
+      `The runner venv uses ${venv.version}; BPCTool needs Python ${PYTHON_MIN.join('.')}+. ` +
+        `Install a newer Python 3, delete the folder ${venvDir}, then start BPCTool again.`,
+    )
+  } else {
     console.log('[setup] Python venv already present.')
   }
 
-  const pipStamp = installStamp([path.join(ROOT, 'runner', 'requirements.txt')])
+  const pipStamp = installStamp([path.join(ROOT, 'runner', 'requirements.txt')], pipStampExtra(venv))
   if (readStamp(PIP_STAMP) !== pipStamp) {
     console.log('[setup] Installing runner requirements...')
     // Not the venv's pip script: it embeds the interpreter path from before the folder was moved.

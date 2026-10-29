@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events'
 import http from 'node:http'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { killProcessTree, waitForHealth } from '../scripts/localRunnerPlugin.js'
+import { killProcessTree, listeningPids, waitForHealth } from '../scripts/localRunnerPlugin.js'
 
 function listen(handler) {
   return new Promise((resolve) => {
@@ -59,6 +59,61 @@ describe('waitForHealth', () => {
     await expect(waitForHealth(new EventEmitter(), { url, timeoutMs: 300 })).rejects.toThrow(
       /did not become healthy/,
     )
+  })
+
+  it('waits for the runner it started, not an older one still on the port', async () => {
+    let instance = 'old-runner'
+    server = await listen((req, res) =>
+      res.writeHead(200).end(JSON.stringify({ status: 'ok', pid: 111, instance })),
+    )
+    const url = `http://127.0.0.1:${server.address().port}/health`
+    let resolved = false
+    const waiting = waitForHealth(new EventEmitter(), { url, instance: 'new-runner' }).then(() => {
+      resolved = true
+    })
+
+    await new Promise((resolve) => setTimeout(resolve, 600))
+    expect(resolved).toBe(false)
+    instance = 'new-runner'
+    await waiting
+    expect(resolved).toBe(true)
+  })
+
+  it('reports an older runner holding the port when the new one exits', async () => {
+    server = await listen((req, res) =>
+      res.writeHead(200).end(JSON.stringify({ status: 'ok', instance: 'old-runner' })),
+    )
+    const url = `http://127.0.0.1:${server.address().port}/health`
+    const child = new EventEmitter()
+    const waiting = waitForHealth(child, { url, instance: 'new-runner' })
+    setTimeout(() => child.emit('exit', 1, null), 400)
+
+    await expect(waiting).rejects.toThrow(/older BPCTool runner is still using port/)
+  })
+})
+
+describe('listeningPids', () => {
+  const netstat = [
+    'Active Connections',
+    '',
+    '  Proto  Local Address          Foreign Address        State           PID',
+    '  TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       1000',
+    '  TCP    127.0.0.1:8787         0.0.0.0:0              ABHÖREN         4321',
+    '  TCP    127.0.0.1:8787         127.0.0.1:50000        HERGESTELLT     4321',
+    '  TCP    127.0.0.1:50000        127.0.0.1:8787         HERGESTELLT     9999',
+    '  TCP    127.0.0.1:18787        0.0.0.0:0              ABHÖREN         2000',
+    '  TCP    127.0.0.1:8787         127.0.0.1:50010        TIME_WAIT       0',
+    '  TCP    [::]:8787              [::]:0                 ÉCOUTE          5555',
+    '  UDP    0.0.0.0:8787           *:*                                    3000',
+  ].join('\r\n')
+
+  it('finds listeners by address columns, whatever language the state is in', () => {
+    expect(listeningPids(netstat, 8787)).toEqual(['4321', '5555'])
+  })
+
+  it('returns nothing when no one listens on the port', () => {
+    expect(listeningPids(netstat, 5173)).toEqual([])
+    expect(listeningPids('', 8787)).toEqual([])
   })
 })
 

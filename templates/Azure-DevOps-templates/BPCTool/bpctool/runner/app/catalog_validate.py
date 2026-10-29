@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
-from .catalog_import import WorkItemDraft
+from .catalog_import import CATALOG_ID_HEADERS, WorkItemDraft
 from .csv_safe import SafeWriter
 from .excel_ir import replace_project_placeholder
 from .mapping import TemplateMapping, normalize
-from .richtext import normalize_field_value
+from .richtext import json_cell_value, normalize_field_value
 
 # Test Case (and inherited TCM types) do not use Agile "New".
 _TEST_CASE_INVALID_STATES = frozenset({"new"})
@@ -143,13 +143,13 @@ def _is_required(value: Any) -> bool:
 
 def _template_default(fd) -> Any | None:
     """Return a usable Fields-sheet default, or None when absent / placeholder."""
-    raw = fd.default_value
+    raw = json_cell_value(fd.default_value)
     if raw is None:
         return None
     text = str(raw).strip()
     if not text or text.lower() == "none":
         return None
-    return normalize_field_value(text, fd.field_type or "")
+    return normalize_field_value(raw if not isinstance(raw, str) else text, fd.field_type or "")
 
 
 @dataclass
@@ -194,12 +194,11 @@ def _area_parts(path: str | None) -> list[str]:
 
 def known_area_paths_from_ir(ir: dict[str, Any], project: str) -> dict[str, str]:
     """Relative area paths the Teams step creates (incl. ancestors), lowercase → canonical."""
+    # The Area paths parser already drops the project column, so a first segment named like
+    # the project is a real level-1 area (as the Teams step creates it).
     known: dict[str, str] = {}
-    lowered_project = project.strip().lower()
     for area in (ir.get("project") or {}).get("area_paths") or []:
         parts = _area_parts(area.get("path") or "")
-        while parts and parts[0].lower() in {lowered_project, *_PROJECT_PLACEHOLDERS}:
-            parts = parts[1:]
         for depth in range(1, len(parts) + 1):
             canonical = "\\".join(parts[:depth])
             known.setdefault(canonical.lower(), canonical)
@@ -212,7 +211,7 @@ def known_iteration_paths_from_ir(ir: dict[str, Any], project: str) -> dict[str,
     lowered_project = project.strip().lower()
     for iteration in (ir.get("project") or {}).get("iteration_paths") or []:
         parts = _area_parts(iteration.get("path") or "")
-        while parts and parts[0].lower() in {lowered_project, *_PROJECT_PLACEHOLDERS}:
+        if parts and parts[0].lower() in {lowered_project, *_PROJECT_PLACEHOLDERS}:
             parts = parts[1:]
         for depth in range(1, len(parts) + 1):
             canonical = "\\".join(parts[:depth])
@@ -258,7 +257,8 @@ def prevalidate_catalog_drafts(
     ``Organization administration``).
 
     Area paths are checked against the template Area paths sheet (plus
-    ``extra_area_paths`` already in the project). A leading segment naming a
+    ``extra_area_paths`` already in the project, as full paths starting with the
+    project name). A leading segment naming a
     different project is rewritten to ``project``. With an ``area_root`` below the
     project (Run configuration *Root area path*), template areas live under it, as
     the Teams step creates them. States are checked only when
@@ -369,18 +369,26 @@ def prevalidate_catalog_drafts(
         # Refs whose value was removed above; don't report them again as "required empty".
         stripped: set[str] = set()
 
-        def add(ref: str, value: Any, kind: str, action: str, detail: str, new_value: Any = "") -> None:
+        def add(
+            ref: str,
+            value: Any,
+            kind: str,
+            action: str,
+            detail: str,
+            new_value: Any = "",
+            row: WorkItemDraft = draft,
+        ) -> None:
             result.issues.append(
                 PrevalidateIssue(
-                    key=draft.key,
-                    work_item_type=draft.work_item_type,
+                    key=row.key,
+                    work_item_type=row.work_item_type,
                     field=ref,
                     value=str(value),
                     kind=kind,
                     action=action,
                     detail=detail,
-                    source_file=draft.source_file,
-                    source_row=draft.source_row,
+                    source_file=row.source_file,
+                    source_row=row.source_row,
                     field_label=label_of(ref),
                     new_value=str(new_value or ""),
                 )
@@ -492,6 +500,7 @@ def prevalidate_catalog_drafts(
             parts = _area_parts(iteration_text)
             joined = "\\".join(parts).lower()
             target = None
+            unknown_path = False
             if parts and parts[0].lower() in {project.lower(), *_PROJECT_PLACEHOLDERS}:
                 target = "\\".join([project, *parts[1:]])
             elif joined in known_iterations:
@@ -499,11 +508,14 @@ def prevalidate_catalog_drafts(
             elif len(parts) == 1 or "\\".join(parts[1:]).lower() in known_iterations:
                 rest = known_iterations.get("\\".join(parts[1:]).lower(), "")
                 target = f"{project}\\{rest}" if rest else project
+            else:
+                target = project
+                unknown_path = True
             if target and target != iteration_text:
                 names_project = parts[0].lower() in {project.lower(), *_PROJECT_PLACEHOLDERS}
                 unknown_root = len(parts) == 1 and joined not in known_iterations and joined != other_project
-                if not names_project and unknown_root:
-                    # One unknown segment: another project's name or an iteration missing from the template.
+                if not names_project and (unknown_root or unknown_path):
+                    # Another project's name or an iteration missing from the template.
                     add(
                         "System.IterationPath",
                         iteration_text,
@@ -789,11 +801,21 @@ PREVALIDATE_CSV_COLUMNS = [
     "Value used",
     "Details",
     "How to fix",
+    *CATALOG_ID_HEADERS,
 ]
 
 
-def write_prevalidate_csv(result: PrevalidateResult, path: Path) -> int:
-    """Every check result, review items first — opens directly in Excel."""
+def write_prevalidate_csv(
+    result: PrevalidateResult,
+    path: Path,
+    *,
+    catalog_ids: Mapping[str, Mapping[str, str]] | None = None,
+) -> int:
+    """Every check result, review items first — opens directly in Excel.
+
+    ``catalog_ids``: row key → the catalog columns to add (see ``catalog_ids_by_key``).
+    """
+    ids = catalog_ids or {}
     order = {kind: index for index, kind in enumerate(REVIEW_KINDS + AUTOMATIC_FIX_KINDS)}
     rows = sorted(
         result.issues,
@@ -818,6 +840,7 @@ def write_prevalidate_csv(result: PrevalidateResult, path: Path) -> int:
                     issue.new_value,
                     issue.detail,
                     text.get("fix", ""),
+                    *(ids.get(issue.key, {}).get(header, "") for header in CATALOG_ID_HEADERS),
                 ]
             )
     return len(rows)

@@ -93,6 +93,7 @@ def settle_output_dir(
     Catalog Import skip rows it never created here. A folder is claimed for this
     project only once its map is known to be this project's (or it has none); a map
     of another project makes that project the owner and moves this run to its own folder.
+    A map mixing this project's work items with another's is never claimed or moved.
     """
     folder.mkdir(parents=True, exist_ok=True)
     owned = folder_owner(folder) is not None
@@ -132,10 +133,19 @@ def settle_output_dir(
             f"creating them. Move {ID_MAP_FILE} out of that folder (keep a copy) or choose another Run "
             "output folder, then run again."
         )
-    if any(name.casefold() == project.casefold() for name in projects):
+    others = sorted(name for name in projects if name.casefold() != project.casefold())
+    if not others:
         if not owned:
             _record_owner(folder, org_url, project)
         return folder
+    if len(others) < len(projects):
+        return refuse(
+            f"{ID_MAP_FILE} in results folder '{folder.name}' lists work items from several projects "
+            f"('{project}' and '{', '.join(others)}'). Catalog Import would skip the other projects' rows "
+            f"instead of creating them in '{project}'. Choose another Run output folder for this project, "
+            f"or move that folder's files somewhere else and keep only '{project}' rows in {ID_MAP_FILE}, "
+            "then run again."
+        )
     if not owned and len(projects) == 1 and move_allowed:
         (owner,) = projects
         _record_owner(folder, org_url, owner)
@@ -149,7 +159,7 @@ def settle_output_dir(
         )
     return refuse(
         f"{ID_MAP_FILE} in results folder '{folder.name}' lists work items from project "
-        f"'{', '.join(sorted(projects))}', not '{project}'. Catalog Import would skip those rows instead "
+        f"'{', '.join(others)}', not '{project}'. Catalog Import would skip those rows instead "
         f"of creating them in '{project}'. Choose another Run output folder for this project, or move "
         "that folder's files somewhere else, then run again."
     )

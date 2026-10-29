@@ -11,6 +11,7 @@ from typing import Any, Callable
 from ..run_outcome import (
     LIVE_SUMMARY_NAME,
     REHEARSAL_SUMMARY_NAME,
+    ado_links,
     build_outcome,
     catalog_placeholder_count,
     project_name_notice,
@@ -99,6 +100,11 @@ def write_run_summary(
         cancelled=cancelled,
         earlier_steps=earlier,
         notices=notices,
+    )
+    outcome["adoLinks"] = ado_links(
+        org_url,
+        project_name=ir["targets"]["project_name"],
+        process_name=ir["targets"]["process_name"],
     )
     summary = {
         "runId": run_id,
@@ -263,6 +269,20 @@ def render_html(summary: dict[str, Any]) -> str:
 
     changes_html = _changes_html(outcome.get("changes"))
 
+    links_html = ""
+    if outcome.get("adoLinks"):
+        anchors = " ".join(
+            f'<a href="{_e(link["url"])}" target="_blank" rel="noreferrer">{_e(link["label"])}</a>'
+            for link in outcome["adoLinks"]
+        )
+        hint = (
+            ' <span class="earlier">A rehearsal creates nothing, so these open only once the project '
+            "and process exist.</span>"
+            if summary["mode"] == "rehearsal"
+            else ""
+        )
+        links_html = f'<p class="ado-links"><strong>Open in Azure DevOps:</strong> {anchors}{hint}</p>'
+
     file_rows = "".join(
         f"""<tr><td><a href="{_e(f['name'])}">{_e(f['label'])}</a></td><td>{_e(f['description'])}</td>
 <td>{'' if f['updatedThisRun'] else '<span class="earlier">earlier run</span>'}</td></tr>"""
@@ -292,12 +312,13 @@ def render_html(summary: dict[str, Any]) -> str:
   .notice {{ background: #eff6ff; border: 1px solid #bfdbfe; border-left: 5px solid var(--info); border-radius: 8px; padding: .6rem 1rem; margin: .75rem 0 0; font-weight: 600; }}
   .attention-list {{ list-style: none; padding: 0; margin: 0; display: grid; gap: .75rem; }}
   .attention {{ background: #fff; border: 1px solid #e5e7eb; border-left: 5px solid var(--warn); border-radius: 8px; padding: .85rem 1rem; }}
-  .attention.error {{ border-left-color: var(--error); }}
+  .attention.error {{ border-left-color: var(--error); }} .attention.info {{ border-left-color: var(--info); }}
   .attention p {{ margin: .25rem 0; }}
   .fix {{ background: #f9fafb; border-radius: 6px; padding: .4rem .6rem; }}
   .examples-label {{ color: var(--muted); font-size: .85rem; margin-bottom: 0; }}
   .examples {{ margin: .15rem 0 .4rem 1.1rem; padding: 0; font-size: .9rem; }}
   a.file {{ display: inline-block; margin-top: .25rem; font-weight: 600; }}
+  .ado-links {{ margin: .75rem 0 0; }} .ado-links a {{ font-weight: 600; margin-right: .75rem; }}
   table {{ width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; overflow: hidden; }}
   th, td {{ padding: .55rem .75rem; border-bottom: 1px solid #f0f1f3; text-align: left; vertical-align: top; }}
   th {{ background: #f9fafb; font-size: .85rem; color: #374151; }}
@@ -322,6 +343,7 @@ def render_html(summary: dict[str, Any]) -> str:
     <strong>{_e(outcome['headline'])}</strong>
     <p>{_e(outcome['subline'])}</p>
   </div>
+  {links_html}
   {notices_html}
   {attention_html}
   {automatic_html}

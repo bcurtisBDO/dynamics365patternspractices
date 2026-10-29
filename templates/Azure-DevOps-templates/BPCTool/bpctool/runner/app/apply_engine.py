@@ -34,6 +34,7 @@ Emit = Callable[[dict[str, Any]], None]
 
 # Steps that need the project to be ready (not still being created) in Azure DevOps.
 _PROJECT_STEPS = {"project", "teams", "backlog", "catalog"}
+CANCEL_BETWEEN_REQUESTS = {"process", "layout", "teams", "backlog"}
 
 
 def run_apply(
@@ -94,6 +95,7 @@ def run_apply(
     for ado in (client, change_reader):
         if ado is not None:
             ado.on_throttle = lambda message: _emit({"type": "info", "message": message})
+            ado.cancel_waits = cancel_requested
 
     output_dir = resolve_output_dir(org_url, request.project_name, request.output_root)
     default_folder_name = default_output_dir(org_url, request.project_name, request.output_root).name
@@ -340,6 +342,9 @@ def run_apply(
                 }
             )
             step_started = time.perf_counter()
+            # Steps that re-run safely stop at their next request on Cancel.
+            if client is not None and step_id in CANCEL_BETWEEN_REQUESTS:
+                client.before_request = check_cancel
 
             try:
                 if step_id == "process":
@@ -419,6 +424,9 @@ def run_apply(
                     "duration_ms": int((time.perf_counter() - step_started) * 1000),
                 }
                 raise
+            finally:
+                if client is not None:
+                    client.before_request = None
 
             duration_ms = int((time.perf_counter() - step_started) * 1000)
             if isinstance(result, dict):

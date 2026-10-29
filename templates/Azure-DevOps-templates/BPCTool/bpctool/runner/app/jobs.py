@@ -10,6 +10,7 @@ from typing import Any
 
 from .apply_engine import run_apply
 from .excel_ir import build_ir
+from .fs_browser import unreadable_file_message
 from .models import (
     ApplyResult,
     DryRunRequest,
@@ -334,10 +335,11 @@ def _execute_job(job_id: str) -> None:
     except Exception as exc:  # noqa: BLE001 - surface to job status
         finished = _now()
         duration_ms = int((time.perf_counter() - job_t0) * 1000)
+        error = unreadable_file_message(exc) if isinstance(exc, OSError) else str(exc)
         with _lock:
             job = _jobs[job_id]
             job["status"] = "failed"
-            job["error"] = str(exc)
+            job["error"] = error
             job["finished_at"] = finished
             job["duration_ms"] = duration_ms
             job["updated_at"] = finished
@@ -346,7 +348,7 @@ def _execute_job(job_id: str) -> None:
                     "timestamp": finished,
                     "type": "job-error",
                     "durationMs": duration_ms,
-                    "message": f"{exc} (after {format_duration_ms(duration_ms)})",
+                    "message": f"{error} (after {format_duration_ms(duration_ms)})",
                 }
             )
     finally:

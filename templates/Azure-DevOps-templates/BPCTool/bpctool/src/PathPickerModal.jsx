@@ -1,11 +1,13 @@
 import { useEffect, useId, useRef, useState } from 'react'
-import { runnerFetch } from './runnerApi.js'
+import { createPortal } from 'react-dom'
+import { holdModalFocus, wrapTabFocus } from './modalFocus.js'
+import { runnerErrorMessage, runnerFetch } from './runnerApi.js'
 
 async function fetchJson(url) {
   const response = await runnerFetch(url)
   const payload = await response.json().catch(() => ({}))
   if (!response.ok) {
-    throw new Error(payload.detail || `Request failed (${response.status})`)
+    throw new Error(runnerErrorMessage(payload, response.status, 'Request failed'))
   }
   return payload
 }
@@ -29,6 +31,15 @@ export default function PathPickerModal({
   const [loading, setLoading] = useState(false)
 
   const loadRequestRef = useRef(0)
+  const dialogRef = useRef(null)
+  const inputRef = useRef(null)
+
+  useEffect(() => {
+    // Not autoFocus: the opener must still hold focus here so it gets it back on close.
+    const release = holdModalFocus(document.getElementById('root'), document)
+    inputRef.current?.focus()
+    return release
+  }, [])
 
   const loadDir = async (path) => {
     loadRequestRef.current += 1
@@ -103,14 +114,17 @@ export default function PathPickerModal({
     Boolean(draft.trim()) &&
     (mode === 'folder' || draft.trim().toLowerCase().endsWith('.xlsx'))
 
-  return (
+  return createPortal(
     <div className="modal-backdrop" role="presentation" onClick={onClose}>
       <div
+        ref={dialogRef}
         className="modal-card path-picker-card"
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}
+        tabIndex={-1}
         onClick={(event) => event.stopPropagation()}
+        onKeyDown={(event) => wrapTabFocus(event, dialogRef.current)}
       >
         <div className="modal-header">
           <h3 id={titleId}>{title}</h3>
@@ -194,7 +208,7 @@ export default function PathPickerModal({
                 ? '/Users/you/BPC Files/2026-Q4'
                 : '/Users/you/.../ADO template guideline.xlsx'
             }
-            autoFocus
+            ref={inputRef}
           />
         </label>
 
@@ -226,6 +240,7 @@ export default function PathPickerModal({
           </button>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   )
 }

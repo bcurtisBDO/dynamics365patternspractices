@@ -5,9 +5,9 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
-from .catalog_import import WorkItemDraft
+from .catalog_import import CATALOG_ID_HEADERS, WorkItemDraft
 from .catalog_validate import MAX_STRING_LENGTH
 from .csv_safe import SafeWriter
 
@@ -321,11 +321,21 @@ FAILURES_CSV_COLUMNS = [
     "Blocked by",
     "Children blocked",
     "Technical detail",
+    *CATALOG_ID_HEADERS,
 ]
 
 
-def write_failures_csv(failures: list[dict[str, Any]], path: Path) -> None:
-    """Root causes first (biggest impact first), then blocked rows grouped by blocker."""
+def write_failures_csv(
+    failures: list[dict[str, Any]],
+    path: Path,
+    *,
+    catalog_ids: Mapping[str, Mapping[str, str]] | None = None,
+) -> None:
+    """Root causes first (biggest impact first), then blocked rows grouped by blocker.
+
+    ``catalog_ids``: row key → the catalog columns to add (see ``catalog_ids_by_key``).
+    """
+    ids = catalog_ids or {}
     def sort_key(item: dict[str, Any]) -> tuple[Any, ...]:
         is_blocked = item.get("category") == "parent_failed"
         return (
@@ -356,5 +366,6 @@ def write_failures_csv(failures: list[dict[str, Any]], path: Path) -> None:
                     item.get("blockedBy", ""),
                     item.get("blockedChildren", "") or "",
                     "" if blocked else ado_error_message(item.get("error", "")),
+                    *(ids.get(item.get("key") or "", {}).get(header, "") for header in CATALOG_ID_HEADERS),
                 ]
             )

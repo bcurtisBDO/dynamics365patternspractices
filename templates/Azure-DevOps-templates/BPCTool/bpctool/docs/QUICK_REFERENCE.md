@@ -80,8 +80,9 @@ Steps: **1** Process Template → **2** Page Layout Setup → **3** Project Crea
 | `matched-by-microsoft-id.csv` | Rows with a new key (e.g. renumbered by a new release) that reused an existing item instead of creating another |
 | `bpctool-target.json` | Which org + project the folder belongs to |
 
+- CSVs that list catalog rows end with the row's Catalog status, Microsoft ID, Mavim ID, Mavim reference and Partner ID (`… MS BPC`) from the workbook.
 - Another project whose name gives the same folder name gets `<org>_<project>-<code>`.
-- Before any step, a run checks that `ado-id-map.csv` lists this project's work items. A run with Catalog Import stops if they belong to another project or no longer exist (project deleted and recreated) — move the file aside or pick another folder.
+- Before any step, a run checks that `ado-id-map.csv` lists this project's work items. A run with Catalog Import stops if any belong to another project or none exist any more (project deleted and recreated) — move the file aside or pick another folder.
 - Reports contain catalog content: don't post them publicly; delete folders you no longer need (but keep `ado-id-map.csv` while the project may be re-imported).
 
 ## Common problems

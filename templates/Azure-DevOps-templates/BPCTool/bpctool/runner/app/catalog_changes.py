@@ -7,10 +7,10 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from .ado_client import AdoClient
-from .catalog_import import WorkItemDraft
+from .catalog_import import CATALOG_ID_HEADERS, WorkItemDraft
 from .csv_safe import SafeDictWriter
 from .mapping import TemplateMapping
 
@@ -81,6 +81,7 @@ CSV_FIELDS = [
     "Usually edited in",
     "Source file",
     "Source row",
+    *CATALOG_ID_HEADERS,
 ]
 
 
@@ -112,6 +113,7 @@ def _text(value: Any) -> str:
 
 _TAG_RE = re.compile(r"<[^>]+>")
 _SPACE_RE = re.compile(r"\s+")
+_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?")
 
 
 def _plain(value: Any) -> str:
@@ -145,7 +147,7 @@ def _comparable(ref: str, value: Any, *, rich: bool, multi: bool, boolean: bool 
     number = _number(text)
     if number is not None:
         return number
-    if re.match(r"^\d{4}-\d{2}-\d{2}([T ]|$)", text):
+    if _DATE_RE.fullmatch(text):
         return text[:10]
     return text
 
@@ -442,7 +444,11 @@ def summarize_changes(changes: list[Change], *, compared: int, examples: int = 3
     }
 
 
-def write_changes_csv(changes: list[Change], path: Path) -> None:
+def write_changes_csv(
+    changes: list[Change], path: Path, *, catalog_ids: Mapping[str, Mapping[str, str]] | None = None
+) -> None:
+    """``catalog_ids``: row key → the catalog columns to add (see ``catalog_ids_by_key``)."""
+    ids = catalog_ids or {}
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = SafeDictWriter(handle, fieldnames=CSV_FIELDS)
         writer.writeheader()
@@ -464,5 +470,6 @@ def write_changes_csv(changes: list[Change], path: Path) -> None:
                     "Usually edited in": owner,
                     "Source file": change.source_file,
                     "Source row": change.source_row or "",
+                    **{header: ids.get(change.key, {}).get(header, "") for header in CATALOG_ID_HEADERS},
                 }
             )

@@ -13,10 +13,15 @@ from __future__ import annotations
 
 import html
 import re
+from datetime import date, datetime, time
+from decimal import Decimal
 from typing import Any
 
+_HTML_TAG_NAMES = r"(?:div|p|br|ul|ol|li|a|span|strong|em|b|i|h[1-6]|table|tr|td|th|pre|code|blockquote)"
+# A real tag closes right after its name (<b>, <br/>, </div>) or carries an attribute
+# (<a href=...>), so angle-bracket placeholders such as "<a customer>" stay plain text.
 _HTML_TAG_RE = re.compile(
-    r"</?(?:div|p|br|ul|ol|li|a|span|strong|em|b|i|h[1-6]|table|tr|td|th|pre|code|blockquote)\b",
+    rf"<(?:/{_HTML_TAG_NAMES}\s*>|{_HTML_TAG_NAMES}(?:\s*/?>|\s+[a-z_:][-\w:.]*\s*=))",
     re.IGNORECASE,
 )
 _HTML_ENTITY_RE = re.compile(r"&(?:amp|lt|gt|quot|nbsp|#\d+|#x[0-9a-f]+);", re.IGNORECASE)
@@ -30,12 +35,7 @@ def looks_like_html(value: Any) -> bool:
     text = "" if value is None else str(value)
     if not text.strip():
         return False
-    sample = text[:4000]
-    if _HTML_TAG_RE.search(sample):
-        return True
-    # Compact fragments that are still HTML-ish
-    lowered = sample.lstrip().lower()
-    return lowered.startswith("<") and ">" in lowered[:80]
+    return bool(_HTML_TAG_RE.search(text[:4000]))
 
 
 def _escape_keep_newlines(text: str) -> str:
@@ -84,8 +84,10 @@ def markdown_to_html(value: Any) -> str:
     lines = text.split("\n")
     parts: list[str] = []
     paragraph: list[str] = []
-    list_kind: str | None = None  # "ul" | "ol"
-    list_items: list[str] = []
+    # Open lists, outermost first: (tag, indent). Every open list has an open <li>.
+    stack: list[tuple[str, int]] = []
+    list_html: list[str] = []
+    blank_lines = 0
 
     def flush_paragraph() -> None:
         nonlocal paragraph
@@ -95,48 +97,56 @@ def markdown_to_html(value: Any) -> str:
         parts.append(f"<p>{body}</p>")
         paragraph = []
 
-    def flush_list() -> None:
-        nonlocal list_kind, list_items
-        if not list_kind or not list_items:
-            list_kind = None
-            list_items = []
+    def close_lists(depth: int = 0) -> None:
+        nonlocal list_html
+        while len(stack) > depth:
+            tag, _ = stack.pop()
+            list_html.append(f"</li></{tag}>")
+        if not stack and list_html:
+            parts.append("".join(list_html))
+            list_html = []
+
+    def add_item(tag: str, indent: int, number: int | None, content: str) -> None:
+        while stack and indent < stack[-1][1]:
+            close_lists(len(stack) - 1)
+        if stack and indent == stack[-1][1] and tag != stack[-1][0]:
+            close_lists(len(stack) - 1)
+        if stack and indent == stack[-1][1]:
+            list_html.append(f"</li><li>{content}")
             return
-        items = "".join(f"<li>{item}</li>" for item in list_items)
-        parts.append(f"<{list_kind}>{items}</{list_kind}>")
-        list_kind = None
-        list_items = []
+        start = f' start="{number}"' if tag == "ol" and number is not None and number != 1 else ""
+        stack.append((tag, indent))
+        list_html.append(f"<{tag}{start}><li>{content}")
 
     for raw in lines:
         if not raw.strip():
-            flush_list()
+            blank_lines += 1
             flush_paragraph()
             continue
 
         bullet = _BULLET_RE.match(raw)
         numbered = _NUMBERED_RE.match(raw)
-        if bullet:
+        if bullet or numbered:
+            if blank_lines > 1:
+                close_lists()
+            blank_lines = 0
             flush_paragraph()
-            kind = "ul"
-            content = _inline_markdown(bullet.group(3).strip())
-            if list_kind and list_kind != kind:
-                flush_list()
-            list_kind = kind
-            list_items.append(content)
-            continue
-        if numbered:
-            flush_paragraph()
-            kind = "ol"
-            content = _inline_markdown(numbered.group(3).strip())
-            if list_kind and list_kind != kind:
-                flush_list()
-            list_kind = kind
-            list_items.append(content)
+            if bullet:
+                add_item("ul", _list_indent(bullet.group(1)), None, _inline_markdown(bullet.group(3).strip()))
+            else:
+                add_item(
+                    "ol",
+                    _list_indent(numbered.group(1)),
+                    int(numbered.group(2)),
+                    _inline_markdown(numbered.group(3).strip()),
+                )
             continue
 
-        flush_list()
+        blank_lines = 0
+        close_lists()
         paragraph.append(raw.rstrip())
 
-    flush_list()
+    close_lists()
     flush_paragraph()
 
     if not parts:
@@ -183,6 +193,22 @@ def normalize_rich_text(
     return text.strip()
 
 
+def json_cell_value(value: Any) -> Any:
+    """Typed Excel cells (dates, times, decimals) as values ``json.dumps`` accepts.
+
+    Excel stores a date as a datetime at midnight, so those become ``YYYY-MM-DD``.
+    """
+    if isinstance(value, datetime):
+        if value.tzinfo is None and value.time() == time(0, 0):
+            return value.date().isoformat()
+        return value.isoformat()
+    if isinstance(value, (date, time)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return int(value) if value.is_finite() and value == value.to_integral_value() else float(value)
+    return value
+
+
 def normalize_field_value(
     value: Any,
     field_type: str,
@@ -192,6 +218,7 @@ def normalize_field_value(
     """Coerce a catalog/template value for ADO, applying rich-text rules for HTML."""
     if value is None:
         return None
+    value = json_cell_value(value)
     ft = (field_type or "").strip().lower()
     if "html" in ft:
         return normalize_rich_text(

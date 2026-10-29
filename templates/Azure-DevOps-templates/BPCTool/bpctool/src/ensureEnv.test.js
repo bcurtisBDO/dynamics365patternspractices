@@ -9,8 +9,10 @@ import {
   nodeVersionSupported,
   parsePythonProbe,
   parseSetupArgs,
+  pipStampExtra,
   pythonCandidates,
   pythonVersionSupported,
+  venvCreateArgs,
 } from '../scripts/ensure-env.mjs'
 
 describe('nodeVersionSupported', () => {
@@ -56,6 +58,25 @@ describe('installStamp', () => {
     writeFileSync(lock, '{"lockfileVersion":3,"packages":{}}')
     expect(installStamp([lock])).not.toBe(first)
     expect(installStamp([path.join(dir, 'missing.txt')])).toMatch(/^[0-9a-f]{64}$/)
+  })
+
+  it('changes when the venv interpreter changes', () => {
+    dir = mkdtempSync(path.join(tmpdir(), 'bpctool-stamp-'))
+    const requirements = path.join(dir, 'requirements.txt')
+    writeFileSync(requirements, 'fastapi>=0.141.1\n')
+    const venv = { executable: '/bpctool/.venv/bin/python', version: 'Python 3.12.4' }
+    const first = installStamp([requirements], pipStampExtra(venv))
+
+    expect(installStamp([requirements], pipStampExtra({ ...venv }))).toBe(first)
+    expect(installStamp([requirements], pipStampExtra({ ...venv, version: 'Python 3.13.1' }))).not.toBe(first)
+    expect(installStamp([requirements])).not.toBe(first)
+  })
+})
+
+describe('venvCreateArgs', () => {
+  it('clears a leftover venv so dangling interpreter links and the old pip stamp go', () => {
+    expect(venvCreateArgs(false)).toEqual(['-m', 'venv', '.venv'])
+    expect(venvCreateArgs(true)).toEqual(['-m', 'venv', '--clear', '.venv'])
   })
 })
 

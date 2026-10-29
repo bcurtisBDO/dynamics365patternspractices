@@ -162,14 +162,17 @@ Each run ends with a **results card** in the UI: a headline, a highlighted line 
 | `import-failures.csv`        | Rows that failed, for Excel: **Fix this row** vs **Blocked by parent**, the problem, how to fix it, source file and row, value tried |
 | `import-prevalidate.csv`     | Every catalog value changed or removed before import (automatic fix vs needs review)                                                 |
 | `ado-id-map.csv`             | Catalog key → work item ID. Re-runs resume from it — keep it                                                                         |
+| `pending-state-updates.csv`  | Items created in their type's first state (e.g. Test Case Design) and then moved to the workbook's State; any not marked `done` are set by the next Catalog Import — keep it |
 | `backfill-links-report.csv`  | Parent-link backfill statuses                                                                                                        |
-| `import-preview.csv`         | Sample of the catalog rows as they will be sent                                                                                      |
+| `import-preview.csv`         | Sample of the catalog rows as they will be sent (after the data checks)                                                              |
 | `import-changes.csv`         | Rehearsal against an existing project: every difference between the workbook and the work items already there, and rows a live run would duplicate |
 | `skipped-deprecated-deleted.csv` | Catalog rows not imported because their Catalog status (or a parent row's) is Deprecated or Deleted |
 | `bpctool-target.json`        | The organization and project this folder belongs to. Another project whose name gives the same folder name gets its own `<org>_<project>-<8 characters>` folder |
 
 
-CSV reports show text starting with `=`, `+`, `-` or `@` with a leading `'` so Excel can't run it as a formula. Reports contain catalog content and work item IDs: keep them with the workbooks, don't post them publicly, and delete folders you no longer need (keep `ado-id-map.csv` while the project may be re-imported).
+Every CSV here that lists catalog rows ends with the row's **Catalog status**, **Microsoft ID**, **Mavim ID**, **Mavim reference** and **Partner ID** (`… MS BPC`) values from the workbook, so each line can be found in the catalog.
+
+CSV reports show text starting with `=`, `+`, `-` or `@` with a leading `'` so Excel can't run it as a formula. Reports contain catalog content and work item IDs: keep them with the workbooks, don't post them publicly, and delete folders you no longer need (keep `ado-id-map.csv` and `pending-state-updates.csv` while the project may be re-imported).
 
 JSON versions (`*-summary.json`, `import-failures.json`, `import-prevalidate.json`, `import-changes.json`) carry the same data and a shared run ID. Catalog import is create-only for fields; a re-run skips items already in `ado-id-map.csv`, and a rehearsal lists the existing items whose values differ. More: [USER_GUIDE §11 Outputs](./bpctool/USER_GUIDE.md#11-outputs-and-artifacts).
 

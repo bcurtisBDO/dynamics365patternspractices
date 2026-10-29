@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import csv
+import errno
 import heapq
+import os
 import threading
 import time
 from collections import defaultdict
@@ -17,10 +19,16 @@ from concurrent.futures import (
 )
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
-from .ado_client import WORK_ITEM_BATCH_LIMIT, AdoClient, AdoError, parent_id_from_relations
-from .catalog_import import WorkItemDraft
+from .ado_client import (
+    WORK_ITEM_BATCH_LIMIT,
+    AdoClient,
+    AdoError,
+    RunCancelled,
+    parent_id_from_relations,
+)
+from .catalog_import import CATALOG_ID_HEADERS, WorkItemDraft, catalog_id_values
 from .csv_safe import SafeDictWriter
 
 Emit = Callable[[str, str], None]
@@ -34,6 +42,7 @@ ID_MAP_FIELDS = [
     "Title",
     "ParentKey",
     "ParentId",
+    *CATALOG_ID_HEADERS,
 ]
 
 # Field set on every draft (defaults to the row key) and used to find a work
@@ -41,12 +50,14 @@ ID_MAP_FIELDS = [
 RECONCILE_FIELD_REF = "MSBPC.microsoftid"
 # Waits before each lookup: a slow create can take a while to show up in WIQL.
 RECONCILE_DELAYS_S = (2.0, 5.0, 10.0, 15.0)
+# Longest a reconcile wait runs on after Cancel.
+RECONCILE_POLL_S = 0.5
 PROGRESS_INTERVAL_S = 1.0
 TEXT_PROGRESS_EVERY = 500
 STATE_FIELD_REF = "System.State"
 STATE_NOT_SET_EXAMPLES = 5
 PENDING_STATES_CSV = "pending-state-updates.csv"
-PENDING_STATE_FIELDS = ["Key", "WorkItemId", "WorkItemType", "State", "Status", "Message"]
+PENDING_STATE_FIELDS = ["Key", "WorkItemId", "WorkItemType", "State", "Status", "Message", *CATALOG_ID_HEADERS]
 STATE_MOVE_DONE = "done"
 STATE_BATCH_SIZE = WORK_ITEM_BATCH_LIMIT
 # Relations come with every field (Azure DevOps won't narrow an expanded read), so
@@ -62,6 +73,7 @@ BACKFILL_REPORT_FIELDS = [
     "Title",
     "Status",
     "Message",
+    *CATALOG_ID_HEADERS,
 ]
 
 
@@ -75,6 +87,45 @@ def clamp_parallel_workers(value: int | None, *, default: int = 4) -> int:
 
 def _never_cancel() -> bool:
     return False
+
+
+def _sleep_unless_cancelled(seconds: float, cancel: ShouldCancel) -> bool:
+    """Sleep in short slices; False as soon as the run is cancelled."""
+    left = seconds
+    while not cancel():
+        if left <= 0:
+            return True
+        step = min(RECONCILE_POLL_S, left)
+        time.sleep(step)
+        left -= step
+    return False
+
+
+class ReconcileCancelled(AdoError):
+    """Cancel came while checking whether an unknown-outcome create went through."""
+
+
+class _Claims:
+    """Work item ids given to a key: the id map's, plus those this run's workers created."""
+
+    def __init__(self, ids: Iterable[int]) -> None:
+        self._lock = threading.Lock()
+        self._ids = set(ids)
+
+    def add(self, work_item_id: int) -> None:
+        with self._lock:
+            self._ids.add(work_item_id)
+
+    def unclaimed(self, ids: list[int]) -> list[int]:
+        with self._lock:
+            return [i for i in ids if i not in self._ids]
+
+    def claim(self, work_item_id: int) -> bool:
+        with self._lock:
+            if work_item_id in self._ids:
+                return False
+            self._ids.add(work_item_id)
+            return True
 
 
 def read_id_map_rows(path: Path) -> list[dict[str, str]]:
@@ -134,21 +185,89 @@ def load_id_map_parents(path: Path) -> dict[str, int]:
 
 def open_id_map_for_append(path: Path) -> tuple[Any, csv.DictWriter]:
     """Open id-map CSV for append, writing header only when creating a new file."""
+    return _open_csv_for_append(path, ID_MAP_FIELDS, ("Key", "WorkItemId"))
+
+
+class _RollbackAppender:
+    """Text sink for csv.DictWriter: each flush() appends what was written since the last one,
+    or nothing. On a write error the file is truncated back, so it never ends in a cut-off row
+    (a cut-off WorkItemId would still parse, as the wrong work item)."""
+
+    def __init__(self, path: Path) -> None:
+        self._raw = path.open("ab", buffering=0)
+        self._pending: list[str] = []
+
+    def write(self, text: str) -> int:
+        self._pending.append(text)
+        return len(text)
+
+    def flush(self) -> None:
+        if not self._pending:
+            return
+        data = "".join(self._pending).encode("utf-8")
+        self._pending.clear()
+        start = os.fstat(self._raw.fileno()).st_size
+        try:
+            view = memoryview(data)
+            while view:
+                written = self._raw.write(view)
+                if not written:
+                    raise OSError(errno.EIO, "No bytes written")
+                view = view[written:]
+        except OSError:
+            try:
+                self._raw.truncate(start)
+            except OSError:
+                pass
+            raise
+
+    def close(self) -> None:
+        try:
+            self.flush()
+        finally:
+            self._raw.close()
+
+    def __enter__(self) -> _RollbackAppender:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+
+def _open_csv_for_append(
+    path: Path, fields: list[str], required: tuple[str, ...]
+) -> tuple[Any, csv.DictWriter]:
+    """Append in the existing file's column order (it may have been reordered in Excel)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     write_header = not path.is_file() or path.stat().st_size == 0
-    # A map saved by Excel may lack a final newline; the next row would join the last one.
+    columns = fields
     needs_newline = False
     if not write_header:
+        with path.open("r", encoding="utf-8-sig", newline="") as existing:
+            header = next(csv.reader(existing), [])
+        missing = [name for name in required if name not in header]
+        if missing:
+            raise ValueError(
+                f"{path.name} has no {' or '.join(missing)} column in its first row, so new rows "
+                f"can't be added to it safely. Put its header row back ({','.join(fields)}) "
+                "or move the file away, then run again."
+            )
+        columns = header
+        # A file saved by Excel may lack a final newline; the next row would join the last one.
         with path.open("rb") as existing:
             existing.seek(-1, 2)
             needs_newline = existing.read(1) not in (b"\n", b"\r")
-    handle = path.open("a", encoding="utf-8", newline="")
+    handle = _RollbackAppender(path)
     if needs_newline:
         handle.write("\r\n")
-    writer = csv.DictWriter(handle, fieldnames=ID_MAP_FIELDS)
+    writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
     if write_header:
         writer.writeheader()
+    try:
         handle.flush()
+    except OSError:
+        handle.close()
+        raise
     return handle, writer
 
 
@@ -168,6 +287,7 @@ def append_id_map_row(
         "Title": draft.title,
         "ParentKey": draft.parent_key or "",
         "ParentId": parent_id or "",
+        **catalog_id_values(draft),
     }
 
     def _write() -> None:
@@ -338,6 +458,22 @@ def import_drafts_parent_aware(
     stats["state_not_set"] = later_state.not_set
     stats["state_not_set_examples"] = later_state.not_set_examples
     stats["state_resumed"] = later_state.resumed
+    if later_state.cancelled:
+        stats["state_cancelled"] = later_state.cancelled
+        emit(
+            "catalog",
+            f"Cancelled before {later_state.cancelled} work item(s) were moved to their State; "
+            f"the next Catalog Import moves them ({PENDING_STATES_CSV})",
+        )
+    if later_state.log_error:
+        stats["state_log_error"] = later_state.log_error
+        emit(
+            "catalog",
+            f"WARNING: couldn't write {PENDING_STATES_CSV} ({later_state.log_error}); "
+            f"{later_state.unlogged} State change(s) aren't recorded in it, so a re-run won't "
+            "retry them if they failed. Free up disk space or close the file in Excel, and "
+            "check the State of the work items created in this run.",
+        )
     if later_state.set_after_create:
         emit(
             "catalog",
@@ -416,17 +552,32 @@ def _create_drafts(
     queue = ReadyQueue(pending, id_map)
     handle, writer = open_id_map_for_append(id_map_path)
     lock = threading.Lock()
-    map_lock = threading.Lock()
+    claims = _Claims(id_map.values())
+    # Created but not in the id map file (key → work item id), after the first write error.
+    unsaved: dict[str, int] = {}
+    write_errors: list[str] = []
 
-    def mapped_ids() -> set[int]:
-        with map_lock:
-            return set(id_map.values())
+    def record(draft: WorkItemDraft, work_item_id: int, parent_id: int | None) -> None:
+        claims.add(work_item_id)
+        with lock:
+            # A failed write is rolled back, but the cause (disk full, file locked) usually
+            # persists, so stop writing to the map.
+            if not write_errors:
+                try:
+                    append_id_map_row(writer, handle, draft, work_item_id, parent_id)
+                    return
+                except OSError as exc:
+                    write_errors.append(str(exc) or type(exc).__name__)
+            unsaved[draft.key] = work_item_id
 
     in_flight: dict[Future, WorkItemDraft] = {}
+    reconcile_cancelled: set[str] = set()
+    # Cancelled while waiting to send (throttle pause / retry wait): not created.
+    not_sent: set[str] = set()
     try:
         with ThreadPoolExecutor(max_workers=workers) as executor:
             while True:
-                if not cancel():
+                if not cancel() and not write_errors:
                     for draft in queue.pop(workers - len(in_flight)):
                         parent_id = id_map.get(draft.parent_key) if draft.parent_key else None
                         future = executor.submit(
@@ -435,8 +586,10 @@ def _create_drafts(
                             draft,
                             project=project,
                             parent_id=parent_id,
-                            mapped_ids=mapped_ids,
+                            claims=claims,
                             later_state=later_state,
+                            record=record,
+                            cancel=cancel,
                         )
                         in_flight[future] = draft
                 if not in_flight:
@@ -446,54 +599,96 @@ def _create_drafts(
                     draft = in_flight.pop(future)
                     try:
                         work_item_id, linked_parent_id, reconciled = future.result()
-                    except (AdoError, KeyError, TypeError, ValueError) as exc:
+                    except ReconcileCancelled:
+                        reconcile_cancelled.add(draft.key)
+                        stats["cancelled"] += 1
+                    except RunCancelled:
+                        not_sent.add(draft.key)
+                    except Exception as exc:  # noqa: BLE001 - the other completed rows must still be handled
                         stats["failed"] += 1
                         if getattr(exc, "outcome_unknown", False):
                             stats["outcome_unknown"] += 1
-                        failures.append(_failure(draft, str(exc)))
+                        failures.append(_failure(draft, str(exc) or type(exc).__name__))
                     else:
-                        with map_lock:
-                            id_map[draft.key] = work_item_id
-                        append_id_map_row(
-                            writer, handle, draft, work_item_id, linked_parent_id, lock=lock
-                        )
-                        stats["created"] += 1
-                        if linked_parent_id is not None:
-                            stats["linked"] += 1
-                        if reconciled:
-                            stats["reconciled"] += 1
+                        id_map[draft.key] = work_item_id
                         queue.parent_created(draft.key)
+                        if draft.key in unsaved:
+                            stats["failed"] += 1
+                            failures.append(
+                                _failure(
+                                    draft,
+                                    f"Created as work item {work_item_id}, but couldn't record it in "
+                                    f"{id_map_path.name} ({write_errors[0]}). Re-run Catalog Import: "
+                                    "it is matched by its Microsoft ID and kept.",
+                                )
+                            )
+                        else:
+                            stats["created"] += 1
+                            if linked_parent_id is not None:
+                                stats["linked"] += 1
+                            if reconciled:
+                                stats["reconciled"] += 1
                     counts["created"] = stats["created"]
                     counts["failed"] = stats["failed"]
                     tracker.advance()
     finally:
-        handle.close()
+        try:
+            handle.close()
+        except OSError:
+            if not write_errors:
+                raise
 
     leftover = queue.remaining()
-    cancelled_keys = _blocked_only_by_unstarted(leftover, id_map) if cancel() else set()
+    stopped = cancel() or bool(write_errors)
+    cancelled_keys = (
+        _blocked_only_by_unstarted(leftover, id_map, reconcile_cancelled | not_sent)
+        if stopped
+        else set()
+    )
+    not_started = len(not_sent)
     for draft in leftover:
         if draft.key in cancelled_keys:
-            stats["cancelled"] += 1
+            not_started += 1
             continue
         stats["missing_parent"] += 1
         stats["failed"] += 1
         failures.append(_failure(draft, f"Parent not imported: {draft.parent_key}"))
-    if stats["cancelled"]:
+    stats["cancelled"] += not_started
+    if write_errors:
         emit(
             "catalog",
-            f"Cancelled: {stats['cancelled']} work item(s) not started; "
+            f"WARNING: couldn't write {id_map_path.name} ({write_errors[0]}), so no more work items "
+            f"were started. {len(unsaved)} work item(s) were created but aren't recorded in it; "
+            f"their IDs are listed as failures. {not_started} work item(s) weren't started. Free up "
+            "disk space or close the file in Excel, then re-run Catalog Import: items already "
+            "created are matched by their Microsoft ID and kept.",
+        )
+    elif not_started:
+        emit(
+            "catalog",
+            f"Cancelled: {not_started} work item(s) not started; "
             f"re-run resumes from {id_map_path.name}",
+        )
+    if reconcile_cancelled:
+        emit(
+            "catalog",
+            f"Cancelled while checking whether {len(reconcile_cancelled)} create(s) with a network "
+            "error went through; re-run Catalog Import: if they were created, they're matched by "
+            "their Microsoft ID and kept.",
         )
     counts["failed"] = stats["failed"]
     tracker.flush()
 
 
 def _blocked_only_by_unstarted(
-    leftover: list[WorkItemDraft], id_map: dict[str, int]
+    leftover: list[WorkItemDraft],
+    id_map: dict[str, int],
+    stopped: frozenset[str] | set[str] = frozenset(),
 ) -> set[str]:
     """Keys whose ancestor chain reaches an imported item (or a root) via unstarted drafts.
 
     Those were stopped by cancel; the rest descend from a parent that failed or is missing.
+    ``stopped``: keys whose create check was cancelled (they may exist; the next run finds out).
     """
     remaining = {draft.key: draft for draft in leftover}
     result: set[str] = set()
@@ -503,7 +698,7 @@ def _blocked_only_by_unstarted(
         while parent in remaining and parent not in seen:
             seen.add(parent)
             parent = remaining[parent].parent_key
-        if not parent or parent in id_map:
+        if not parent or parent in id_map or parent in stopped:
             result.add(draft.key)
     return result
 
@@ -516,6 +711,8 @@ class _StateMove:
     state: str
     source_file: str = ""
     source_row: int | str = ""
+    # (CSV header, value) pairs for the log's catalog columns.
+    catalog_ids: tuple[tuple[str, str], ...] = ()
 
 
 class StateAfterCreate:
@@ -552,7 +749,12 @@ class StateAfterCreate:
         self.set_after_create = 0
         self.not_set = 0
         self.resumed = 0
+        # Not sent because the run was cancelled while waiting (still pending in the log).
+        self.cancelled = 0
         self.not_set_examples: list[dict[str, Any]] = []
+        # First error writing the log; once set, nothing more is written to it this run.
+        self.log_error = ""
+        self.unlogged = 0
 
     @staticmethod
     def _pair(draft: WorkItemDraft, state: str) -> tuple[str, str]:
@@ -595,6 +797,11 @@ class StateAfterCreate:
                     state,
                     draft.source_file if draft else "",
                     draft.source_row if draft else "",
+                    tuple(
+                        catalog_id_values(draft).items()
+                        if draft
+                        else ((header, str(row.get(header) or "")) for header in CATALOG_ID_HEADERS)
+                    ),
                 )
             )
         if moves:
@@ -611,27 +818,29 @@ class StateAfterCreate:
 
     def defer(self, draft: WorkItemDraft, work_item_id: int, state: str) -> None:
         move = _StateMove(
-            draft.key, work_item_id, draft.work_item_type, state, draft.source_file, draft.source_row
+            draft.key,
+            work_item_id,
+            draft.work_item_type,
+            state,
+            draft.source_file,
+            draft.source_row,
+            tuple(catalog_id_values(draft).items()),
         )
         with self._lock:
             self._log_locked(move, "pending", "")
             self._enqueue_locked(move)
 
     def finish(self) -> None:
-        """Send what is still queued and wait for every batch."""
+        """Send what is still queued and wait for every batch (``_send`` never raises)."""
         with self._lock:
             self._submit_locked()
             sent, self._sent = self._sent, []
         try:
-            for future in sent:
-                future.result()
+            wait(sent)
         finally:
             self._sender.shutdown(wait=True)
             with self._lock:
-                if self._log_handle is not None:
-                    self._log_handle.close()
-                    self._log_handle = None
-                    self._log_writer = None
+                self._close_log_locked()
 
     def _enqueue_locked(self, move: _StateMove) -> None:
         self._queue.append(move)
@@ -644,10 +853,32 @@ class StateAfterCreate:
             self._sent.append(self._sender.submit(self._send, batch))
 
     def _send(self, batch: list[_StateMove]) -> None:
-        errors: list[str | None] | None = None
+        try:
+            errors = self._update(batch)
+        except RunCancelled:
+            # Still logged as pending, so the next run sends them.
+            with self._lock:
+                self.cancelled += len(batch)
+            return
+        except Exception as exc:  # noqa: BLE001 - rows stay pending, so the next run sends them again
+            error = f"State update failed: {str(exc) or type(exc).__name__}"
+            with self._lock:
+                for move in batch:
+                    self._not_set_locked(move, error)
+            return
+        with self._lock:
+            for move, error in zip(batch, errors, strict=True):
+                if error is None:
+                    self.set_after_create += 1
+                    self._log_locked(move, STATE_MOVE_DONE, "")
+                    continue
+                self._log_locked(move, "failed", error[:300])
+                self._not_set_locked(move, error)
+
+    def _update(self, batch: list[_StateMove]) -> list[str | None]:
         if self._use_batch:
             try:
-                errors = self._client.update_work_items_batch(
+                return self._client.update_work_items_batch(
                     [(move.work_item_id, {STATE_FIELD_REF: move.state}) for move in batch]
                 )
             except AdoError as exc:
@@ -658,56 +889,68 @@ class StateAfterCreate:
                         f"Azure DevOps didn't accept a batch State update ({exc}); "
                         "moving States one work item at a time",
                     )
-        if errors is None:
-            errors = []
-            for move in batch:
-                try:
-                    self._client.update_work_item_fields(
-                        self._project, move.work_item_id, {STATE_FIELD_REF: move.state}
-                    )
-                    errors.append(None)
-                except AdoError as exc:
-                    errors.append(str(exc))
-        with self._lock:
-            for move, error in zip(batch, errors, strict=True):
-                if error is None:
-                    self.set_after_create += 1
-                    self._log_locked(move, STATE_MOVE_DONE, "")
-                    continue
-                self.not_set += 1
-                self._log_locked(move, "failed", error[:300])
-                if len(self.not_set_examples) < STATE_NOT_SET_EXAMPLES:
-                    self.not_set_examples.append(
-                        {
-                            "key": move.key,
-                            "workItemId": move.work_item_id,
-                            "workItemType": move.work_item_type,
-                            "state": move.state,
-                            "sourceFile": move.source_file,
-                            "sourceRow": move.source_row,
-                            "error": error[:300],
-                        }
-                    )
+        errors: list[str | None] = []
+        for move in batch:
+            try:
+                self._client.update_work_item_fields(
+                    self._project, move.work_item_id, {STATE_FIELD_REF: move.state}
+                )
+                errors.append(None)
+            except RunCancelled:
+                raise
+            except Exception as exc:  # noqa: BLE001 - logged as failed; the next run retries it
+                errors.append(str(exc) or type(exc).__name__)
+        return errors
+
+    def _not_set_locked(self, move: _StateMove, error: str) -> None:
+        self.not_set += 1
+        if len(self.not_set_examples) < STATE_NOT_SET_EXAMPLES:
+            self.not_set_examples.append(
+                {
+                    "key": move.key,
+                    "workItemId": move.work_item_id,
+                    "workItemType": move.work_item_type,
+                    "state": move.state,
+                    "sourceFile": move.source_file,
+                    "sourceRow": move.source_row,
+                    "error": error[:300],
+                }
+            )
 
     def _log_locked(self, move: _StateMove, status: str, message: str) -> None:
-        if self._log_writer is None:
-            self._log_path.parent.mkdir(parents=True, exist_ok=True)
-            new_file = not self._log_path.is_file() or self._log_path.stat().st_size == 0
-            self._log_handle = self._log_path.open("a", encoding="utf-8", newline="")
-            self._log_writer = csv.DictWriter(self._log_handle, fieldnames=PENDING_STATE_FIELDS)
-            if new_file:
-                self._log_writer.writeheader()
-        self._log_writer.writerow(
-            {
-                "Key": move.key,
-                "WorkItemId": move.work_item_id,
-                "WorkItemType": move.work_item_type,
-                "State": move.state,
-                "Status": status,
-                "Message": message,
-            }
-        )
-        self._log_handle.flush()
+        if self.log_error:
+            self.unlogged += 1
+            return
+        try:
+            if self._log_writer is None:
+                self._log_handle, self._log_writer = _open_csv_for_append(
+                    self._log_path, PENDING_STATE_FIELDS, ("Key", "WorkItemId", "Status")
+                )
+            self._log_writer.writerow(
+                {
+                    "Key": move.key,
+                    "WorkItemId": move.work_item_id,
+                    "WorkItemType": move.work_item_type,
+                    "State": move.state,
+                    "Status": status,
+                    "Message": message,
+                    **dict(move.catalog_ids),
+                }
+            )
+            self._log_handle.flush()
+        except (OSError, ValueError) as exc:
+            self.log_error = str(exc) or type(exc).__name__
+            self.unlogged += 1
+            self._close_log_locked()
+
+    def _close_log_locked(self) -> None:
+        handle, self._log_handle, self._log_writer = self._log_handle, None, None
+        if handle is None:
+            return
+        try:
+            handle.close()
+        except OSError as exc:
+            self.log_error = self.log_error or str(exc)
 
 
 def state_rejected_on_create(exc: AdoError) -> bool:
@@ -734,6 +977,7 @@ def _send_create(
     project: str,
     parent_id: int | None,
     later_state: StateAfterCreate | None = None,
+    on_created: Callable[[int], None] | None = None,
 ) -> int:
     def create(fields: dict[str, Any]) -> int:
         created = client.create_work_item(
@@ -744,7 +988,18 @@ def _send_create(
             dry_run=False,
             markdown_format_fields=draft.markdown_format_fields,
         )
-        return int(created["id"])
+        try:
+            work_item_id = int(created["id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise AdoError(
+                "Azure DevOps accepted the create but its reply has no work item ID "
+                f"({type(exc).__name__}: {exc}); outcome unknown, not retried",
+                transient=True,
+                outcome_unknown=True,
+            ) from exc
+        if on_created is not None:
+            on_created(work_item_id)
+        return work_item_id
 
     state = str(draft.fields.get(STATE_FIELD_REF) or "").strip()
     if later_state is None or not state:
@@ -768,17 +1023,29 @@ def _create_one(
     *,
     project: str,
     parent_id: int | None,
-    mapped_ids: Callable[[], set[int]] | None = None,
+    claims: _Claims | None = None,
     later_state: StateAfterCreate | None = None,
+    record: Callable[[WorkItemDraft, int, int | None], None] | None = None,
+    cancel: ShouldCancel | None = None,
 ) -> tuple[int, int | None, bool]:
     """Return (work item id, parent id linked in the create payload, reconciled).
 
-    ``mapped_ids``: work item ids already in the id map (under other keys), read when
-    an unknown-outcome create is looked up.
+    ``claims``: work item ids already given to other keys, skipped when an
+    unknown-outcome create is looked up. ``record`` is called with the new id as soon
+    as it is known, before anything else that can fail.
     """
+    def on_created(work_item_id: int) -> None:
+        if record is not None:
+            record(draft, work_item_id, parent_id)
+
     try:
         work_item_id = _send_create(
-            client, draft, project=project, parent_id=parent_id, later_state=later_state
+            client,
+            draft,
+            project=project,
+            parent_id=parent_id,
+            later_state=later_state,
+            on_created=on_created,
         )
         return work_item_id, parent_id, False
     except AdoError as exc:
@@ -788,9 +1055,11 @@ def _create_one(
 
     # After an unknown-outcome create, record no ParentId so backfill verifies the link.
     existing = _find_existing_after_unknown_create(
-        client, draft, project=project, original=original, claimed=mapped_ids
+        client, draft, project=project, original=original, claims=claims, cancel=cancel
     )
     if existing is not None:
+        if record is not None:
+            record(draft, existing, None)
         state = str(draft.fields.get(STATE_FIELD_REF) or "").strip()
         if later_state is not None and state and later_state.rejected(draft, state):
             later_state.defer(draft, existing, state)
@@ -810,12 +1079,17 @@ def _find_existing_after_unknown_create(
     *,
     project: str,
     original: AdoError,
-    claimed: Callable[[], set[int]] | None = None,
+    claims: _Claims | None = None,
+    cancel: ShouldCancel | None = None,
 ) -> int | None:
-    """The item the lost create made, ignoring items the id map gives to other rows."""
+    """The item the lost create made, ignoring items already given to other rows (claimed)."""
     ids: list[int] = []
     for delay in RECONCILE_DELAYS_S:
-        time.sleep(delay)
+        if not _sleep_unless_cancelled(delay, cancel or _never_cancel):
+            raise ReconcileCancelled(
+                f"{original}; run cancelled before checking whether it was created",
+                outcome_unknown=True,
+            )
         try:
             ids = client.find_work_item_ids(
                 project,
@@ -824,6 +1098,12 @@ def _find_existing_after_unknown_create(
                 field_ref=RECONCILE_FIELD_REF,
                 field_value=draft.fields.get(RECONCILE_FIELD_REF),
             )
+        except RunCancelled as exc:
+            # The create may have gone through, so this isn't "not sent".
+            raise ReconcileCancelled(
+                f"{original}; run cancelled before checking whether it was created",
+                outcome_unknown=True,
+            ) from exc
         except AdoError as lookup_exc:
             raise AdoError(
                 f"{original}; couldn't check whether it was created ({lookup_exc}), so it "
@@ -831,15 +1111,15 @@ def _find_existing_after_unknown_create(
                 "matched by its Microsoft ID and kept; if not, it is created then.",
                 outcome_unknown=True,
             ) from lookup_exc
-        if ids and claimed is not None:
-            taken = claimed()
-            ids = [i for i in ids if i not in taken]
+        if ids and claims is not None:
+            ids = claims.unclaimed(ids)
         if ids:
             break
     if not ids:
         return None
     if len(ids) == 1:
-        return ids[0]
+        # Another worker may have taken it since the lookup.
+        return ids[0] if claims is None or claims.claim(ids[0]) else None
     raise AdoError(
         f"{original}; {len(ids)} matching work items already exist "
         f"({', '.join(str(i) for i in ids[:5])}). Remove duplicates, then add the "
@@ -909,7 +1189,11 @@ def _ensure_parent_link(
 
 
 def _record_confirmed_parents(id_map_path: Path, rows: list[dict[str, Any]]) -> int:
-    """Append a row with ParentId per confirmed link (the map's last row per key wins)."""
+    """Append a row with ParentId per confirmed link (the map's last row per key wins).
+
+    All rows are added or, on a write error, none. Raises OSError / ValueError when the map
+    can't be opened or written.
+    """
     if not rows:
         return 0
     handle, writer = open_id_map_for_append(id_map_path)
@@ -923,8 +1207,10 @@ def _record_confirmed_parents(id_map_path: Path, rows: list[dict[str, Any]]) -> 
                     "Title": row["Title"],
                     "ParentKey": row["Parent Key"],
                     "ParentId": row["Parent ADO ID"],
+                    **{header: row.get(header, "") for header in CATALOG_ID_HEADERS},
                 }
             )
+        handle.flush()
     finally:
         handle.close()
     return len(rows)
@@ -989,6 +1275,7 @@ def backfill_parent_links(
             "Title": draft.title,
             "Status": "planned",
             "Message": "",
+            **catalog_id_values(draft),
         }
         if recorded.get(draft.key) == expected_parent_id:
             row["Status"] = "already_linked"
@@ -1037,7 +1324,7 @@ def backfill_parent_links(
                 batch = futures[future]
                 try:
                     results = future.result()
-                except CancelledError:
+                except (CancelledError, RunCancelled):
                     for index in batch:
                         rows[index]["Message"] = "Not checked (run cancelled)"
                     counts["cancelled"] += len(batch)
@@ -1057,7 +1344,16 @@ def backfill_parent_links(
 
     if id_map_path is not None:
         confirmed = [rows[i] for i in to_check if rows[i]["Status"] in ("already_linked", "linked")]
-        counts["newly_recorded"] = _record_confirmed_parents(id_map_path, confirmed)
+        try:
+            counts["newly_recorded"] = _record_confirmed_parents(id_map_path, confirmed)
+        except (OSError, ValueError) as exc:
+            counts["not_recorded"] = len(confirmed)
+            emit(
+                "catalog",
+                f"WARNING: couldn't record {len(confirmed)} confirmed parent link(s) in "
+                f"{id_map_path.name} ({exc}). The links are in Azure DevOps; the next Catalog "
+                "Import checks them again. Close the file in Excel if it's open.",
+            )
         if counts["newly_recorded"]:
             emit(
                 "catalog",
@@ -1066,10 +1362,14 @@ def backfill_parent_links(
             )
 
     report_path = output_dir / "backfill-links-report.csv"
-    with report_path.open("w", encoding="utf-8", newline="") as handle:
-        writer = SafeDictWriter(handle, fieldnames=BACKFILL_REPORT_FIELDS)
-        writer.writeheader()
-        writer.writerows(rows)
+    try:
+        with report_path.open("w", encoding="utf-8-sig", newline="") as handle:
+            writer = SafeDictWriter(handle, fieldnames=BACKFILL_REPORT_FIELDS)
+            writer.writeheader()
+            writer.writerows(rows)
+        wrote = f"wrote {report_path.name}"
+    except OSError as exc:
+        wrote = f"WARNING: couldn't write {report_path.name} ({exc}); close it in Excel if it's open"
 
     summary = ", ".join(
         f"{k}={v}"
@@ -1078,7 +1378,6 @@ def backfill_parent_links(
     )
     emit(
         "catalog",
-        f"Parent-link backfill finished: {summary or 'no changes'}; "
-        f"wrote {report_path.name}",
+        f"Parent-link backfill finished: {summary or 'no changes'}; {wrote}",
     )
     return counts

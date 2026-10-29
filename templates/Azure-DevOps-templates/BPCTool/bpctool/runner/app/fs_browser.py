@@ -25,8 +25,36 @@ def is_network_path(path_str: str) -> bool:
     return len(head) == 2 and all(char in "\\/" for char in head)
 
 
+def unreadable_file_message(exc: OSError) -> str:
+    """Plain message for a file the runner couldn't open, without the "[Errno 13]" prefix."""
+    if exc.filename is None:
+        return str(exc)
+    name = os.fsdecode(exc.filename)
+    if isinstance(exc, PermissionError):
+        return (
+            f"Can't open {name}: permission denied. "
+            "If it's open in another program, close it and try again."
+        )
+    if isinstance(exc, FileNotFoundError):
+        return f"File not found: {name}"
+    return f"Can't read {name}: {exc.strerror or type(exc).__name__}."
+
+
 def _home() -> Path:
     return Path.home().expanduser().resolve()
+
+
+def _windows_drives() -> list[str]:
+    """Drive roots C:\\ to Z:\\ without touching them (a disconnected mapped drive stalls)."""
+    listdrives = getattr(os, "listdrives", None)
+    if listdrives is not None:
+        letters = {drive[0].upper() for drive in listdrives() if drive[1:2] == ":"}
+    else:
+        import ctypes
+
+        mask = ctypes.windll.kernel32.GetLogicalDrives()
+        letters = {chr(ord("A") + bit) for bit in range(26) if mask & (1 << bit)}
+    return [f"{letter}:\\" for letter in "CDEFGHIJKLMNOPQRSTUVWXYZ" if letter in letters]
 
 
 def list_roots() -> list[dict[str, str]]:
@@ -41,10 +69,8 @@ def list_roots() -> list[dict[str, str]]:
         if release and release != catalog:
             roots.append({"label": f"Latest release ({release.name})", "path": str(release.resolve())})
     if os.name == "nt":
-        for letter in "CDEFGHIJKLMNOPQRSTUVWXYZ":
-            drive = Path(f"{letter}:/")
-            if drive.exists():
-                roots.append({"label": f"{letter}:", "path": str(drive.resolve())})
+        # Not resolve(): a mapped network drive resolves to its \\server\share path.
+        roots.extend({"label": drive[:2], "path": drive} for drive in _windows_drives())
     else:
         roots.append({"label": "/", "path": "/"})
     # de-dupe by path
@@ -95,7 +121,8 @@ def list_directory(path_str: str | None, *, directories_only: bool = False) -> d
         except OSError:
             continue
         if not is_dir:
-            if directories_only or child.suffix.lower() != ".xlsx":
+            # ~$Book.xlsx is the lock file Excel keeps beside an open workbook.
+            if directories_only or child.suffix.lower() != ".xlsx" or name.startswith("~$"):
                 continue
         entries.append(
             {

@@ -25,6 +25,7 @@ def _draft(key: str, status: str = "40 - Published", parent: str | None = None) 
         fields={"System.Title": f"Title {key}", CATALOG_STATUS: status},
         source_file="bpc.xlsx",
         source_row=7,
+        catalog_ids={"Catalog status MS BPC": status, "Microsoft ID MS BPC": f"MS-{key}"},
     )
 
 
@@ -54,8 +55,10 @@ def test_retired_rows_and_everything_below_them_are_skipped(tmp_path) -> None:
         rows = list(csv.DictReader(handle))
     assert rows[0] == {
         "Key": "1.1", "Work item type": "Process", "Title": "Title 1.1",
-        "Catalog status": "65 - Deprecated (final)", "Why skipped": "Catalog status is '65 - Deprecated (final)'",
-        "Source file": "bpc.xlsx", "Source row": "7",
+        "Catalog status MS BPC": "65 - Deprecated (final)",
+        "Why skipped": "Catalog status is '65 - Deprecated (final)'",
+        "Source file": "bpc.xlsx", "Source row": "7", "Microsoft ID MS BPC": "MS-1.1",
+        "Mavim ID MS BPC": "", "Mavim reference MS BPC": "", "Partner ID MS BPC": "",
     }
 
 

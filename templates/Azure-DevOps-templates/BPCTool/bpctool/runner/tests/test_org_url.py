@@ -18,6 +18,10 @@ from app.org_url import normalize_ado_org_url, parse_ado_org_url
         ("https://contoso.visualstudio.com/", "contoso"),
         ("https://contoso.visualstudio.com/DefaultCollection", "contoso"),
         ("contoso.visualstudio.com", "contoso"),
+        ("contoso.visualstudio.com/", "contoso"),
+        ("contoso.visualstudio.com/DefaultCollection", "contoso"),
+        ("c.visualstudio.com", "c"),
+        ("dev.azure.com/contoso/", "contoso"),
         ("https://CONTOSO.visualstudio.com", "contoso"),
     ],
 )
@@ -37,6 +41,16 @@ def test_parse_accepts_modern_and_legacy(raw: str, org: str) -> None:
         "https://app.visualstudio.com",
         "https://vssps.visualstudio.com",
         "not a url!!!",
+        "https://dev.azure.com/_apis/projects",
+        "dev.azure.com/_apis/x",
+        "https://dev.azure.com/-contoso",
+        "https://dev.azure.com/contoso-",
+        "https://dev.azure.com/con.toso",
+        "https://dev.azure.com/con%20toso",
+        "https://-contoso.visualstudio.com",
+        "https://a.b.visualstudio.com",
+        "app.visualstudio.com/",
+        "contoso.visualstudio.com:8080/",
     ],
 )
 def test_parse_rejects_invalid(raw: str) -> None:

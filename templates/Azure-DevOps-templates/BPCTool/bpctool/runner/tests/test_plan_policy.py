@@ -73,3 +73,13 @@ def test_steps_must_be_known_and_non_empty(model) -> None:
 def test_steps_are_normalized_to_engine_order() -> None:
     request = DryRunRequest(**_request(["Catalog", "process", "catalog"]))
     assert request.steps == ["process", "catalog"]
+
+
+def test_plan_warns_about_field_descriptions_over_the_limit(ir) -> None:
+    custom = next(field for field in ir["process"]["fields"] if field.get("custom_field"))
+    custom["description"] = "x" * 300
+    plan = _plan(ir, "always-update", ["process"])
+    [warning] = [w for w in plan.warnings if "field description(s)" in w]
+    assert f"{custom['reference_name']} (300)" in warning
+    assert "255-character limit" in warning
+    assert not any("field description(s)" in w for w in _plan(ir, "always-update", ["teams"]).warnings)

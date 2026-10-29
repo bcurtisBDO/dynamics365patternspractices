@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any, Callable
+from urllib.parse import quote
 
 from ..ado_client import AdoClient, AdoError
 
@@ -16,6 +17,7 @@ def apply_project(
     dry_run: bool,
     emit: Emit,
     process_id: str | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     project_name = ir["targets"]["project_name"]
     process_name = ir["targets"]["process_name"]
@@ -40,13 +42,23 @@ def apply_project(
     if not process_id:
         raise AdoError(f'Process "{process_name}" must exist before project creation.')
 
-    existing = client.get_project_id(project_name)
+    existing = client.get_ready_project_id(
+        project_name,
+        should_cancel=should_cancel,
+        on_wait=lambda state: emit(
+            "project",
+            f"Project '{project_name}' is still being set up in Azure DevOps (state: {state}); "
+            "waiting until it's ready…",
+        ),
+    )
     if existing:
         _require_project_on_process(client, existing, project_name, process_id, process_name, emit)
         stats["project_id"] = existing
         stats["existed"] = True
         emit("project", f"Project already exists: {project_name} ({existing})")
-        if description:
+        if description and _current_description(client, existing) == description:
+            emit("project", "Project description already matches; left as is")
+        elif description:
             try:
                 client.update_project_description(existing, description)
                 stats["description_updated"] = True
@@ -59,7 +71,7 @@ def apply_project(
         return stats
 
     project_id = client.create_project(
-        project_name, process_id, description=description
+        project_name, process_id, description=description, should_cancel=should_cancel
     )
     if not project_id:
         raise AdoError(f'Project "{project_name}" creation did not complete in time.')
@@ -71,6 +83,15 @@ def apply_project(
         + (f" — description set ({len(description)} chars)" if description else ""),
     )
     return stats
+
+
+def _current_description(client: AdoClient, project_id: str) -> str | None:
+    """The project's description, or None if it can't be read (then it is sent anyway)."""
+    try:
+        data = client.get(f"/_apis/projects/{quote(project_id, safe='')}", api_version="7.1-preview.4") or {}
+    except AdoError:
+        return None
+    return str(data.get("description") or "").strip()
 
 
 def _require_project_on_process(

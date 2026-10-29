@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .ado_client import AdoClient
-from .catalog_import import WorkItemDraft
+from .catalog_import import MICROSOFT_ID_HEADER, WorkItemDraft, catalog_id_headers, catalog_id_values
 from .catalog_runtime import ID_MAP_FIELDS, read_id_map_rows
 from .csv_safe import SafeDictWriter
 from .failure_explain import SEVERAL_MATCHES_PREFIX
@@ -218,6 +218,7 @@ def apply_to_id_map(matches: ExistingMatches, id_map: dict[str, int], id_map_pat
                 "Title": match.draft.title,
                 "ParentKey": match.draft.parent_key or "",
                 "ParentId": "",
+                **catalog_id_values(match.draft),
             }
         )
     temp = id_map_path.with_name(id_map_path.name + ".tmp")
@@ -235,10 +236,11 @@ MATCHED_FIELDS = [
     "Work item ID",
     "Work item type",
     "Title",
-    "Microsoft ID",
+    MICROSOFT_ID_HEADER,
     "Previous key",
     "Source file",
     "Source row",
+    *catalog_id_headers(without=(MICROSOFT_ID_HEADER,)),
 ]
 
 
@@ -257,10 +259,11 @@ def write_matched_csv(matches: ExistingMatches, path: Path) -> None:
                     "Work item ID": match.work_item_id,
                     "Work item type": match.draft.work_item_type,
                     "Title": match.draft.title,
-                    "Microsoft ID": match.draft.fields.get(MICROSOFT_ID) or "",
+                    MICROSOFT_ID_HEADER: match.draft.fields.get(MICROSOFT_ID) or "",
                     "Previous key": "; ".join(match.previous_keys),
                     "Source file": match.draft.source_file,
                     "Source row": match.draft.source_row,
+                    **catalog_id_values(match.draft, without=(MICROSOFT_ID_HEADER,)),
                 }
             )
         for draft, work_item_id in matches.released:
@@ -272,10 +275,11 @@ def write_matched_csv(matches: ExistingMatches, path: Path) -> None:
                     "Work item ID": work_item_id,
                     "Work item type": draft.work_item_type,
                     "Title": draft.title,
-                    "Microsoft ID": draft.fields.get(MICROSOFT_ID) or "",
+                    MICROSOFT_ID_HEADER: draft.fields.get(MICROSOFT_ID) or "",
                     "Previous key": "",
                     "Source file": draft.source_file,
                     "Source row": draft.source_row,
+                    **catalog_id_values(draft, without=(MICROSOFT_ID_HEADER,)),
                 }
             )
         for item in matches.several:
@@ -286,9 +290,10 @@ def write_matched_csv(matches: ExistingMatches, path: Path) -> None:
                     "Work item ID": ", ".join(str(i) for i in item.work_item_ids),
                     "Work item type": item.draft.work_item_type,
                     "Title": item.draft.title,
-                    "Microsoft ID": item.draft.fields.get(MICROSOFT_ID) or "",
+                    MICROSOFT_ID_HEADER: item.draft.fields.get(MICROSOFT_ID) or "",
                     "Previous key": "",
                     "Source file": item.draft.source_file,
                     "Source row": item.draft.source_row,
+                    **catalog_id_values(item.draft, without=(MICROSOFT_ID_HEADER,)),
                 }
             )

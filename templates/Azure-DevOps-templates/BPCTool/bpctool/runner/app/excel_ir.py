@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import hashlib
 import re
+import zipfile
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
+from openpyxl.utils.exceptions import InvalidFileException
+
+from .richtext import json_cell_value
 
 IR_VERSION = "2026.10-1"
 
@@ -42,22 +46,43 @@ CATALOG_EXCLUDE_HINTS = (
     "guideline",
 )
 
+# Encrypted / sensitivity-labelled workbooks are OLE files, not zips; KeyError is a zip
+# missing a required part.
+_UNREADABLE_ERRORS = (zipfile.BadZipFile, InvalidFileException, PermissionError, KeyError)
+
 
 def _cell(value: Any) -> str:
     if value is None:
         return ""
-    return str(value).strip()
+    return str(json_cell_value(value)).strip()
+
+
+def _unreadable_workbook(path: Path | str, exc: Exception) -> ValueError:
+    name = Path(path).name
+    if isinstance(exc, PermissionError):
+        return ValueError(
+            f"Couldn't read '{name}': permission denied. Close it in Excel (or wait for OneDrive "
+            "to finish syncing), check you have access to the file, then try again."
+        )
+    return ValueError(
+        f"Couldn't open '{name}' as an Excel workbook. It may be encrypted or protected by a "
+        "sensitivity label, damaged, or not a real .xlsx file. Open it in Excel, remove the "
+        "password or label (or Save As a new .xlsx), then try again."
+    )
 
 
 def _sheet_rows(path: Path, sheet_name: str) -> list[list[Any]]:
-    wb = load_workbook(path, read_only=True, data_only=True)
     try:
-        if sheet_name not in wb.sheetnames:
-            raise ValueError(f"Sheet '{sheet_name}' not found in {path.name}")
-        ws = wb[sheet_name]
-        return [list(row) for row in ws.iter_rows(values_only=True)]
-    finally:
-        wb.close()
+        wb = load_workbook(path, read_only=True, data_only=True)
+        try:
+            if sheet_name not in wb.sheetnames:
+                raise ValueError(f"Sheet '{sheet_name}' not found in {path.name}")
+            ws = wb[sheet_name]
+            return [list(row) for row in ws.iter_rows(values_only=True)]
+        finally:
+            wb.close()
+    except _UNREADABLE_ERRORS as exc:
+        raise _unreadable_workbook(path, exc) from exc
 
 
 def _header_map(header_row: list[Any]) -> dict[str, int]:
@@ -447,12 +472,15 @@ def catalog_sheet_rows(path: Path) -> tuple[str, tuple[tuple[Any, ...], ...]]:
 def _read_first_sheet(
     path: str, _mtime_ns: int, _size: int
 ) -> tuple[str, tuple[tuple[Any, ...], ...]]:
-    wb = load_workbook(path, read_only=True, data_only=True)
     try:
-        sheet_name = wb.sheetnames[0]
-        rows = tuple(wb[sheet_name].iter_rows(values_only=True))
-    finally:
-        wb.close()
+        wb = load_workbook(path, read_only=True, data_only=True)
+        try:
+            sheet_name = wb.sheetnames[0]
+            rows = tuple(wb[sheet_name].iter_rows(values_only=True))
+        finally:
+            wb.close()
+    except _UNREADABLE_ERRORS as exc:
+        raise _unreadable_workbook(path, exc) from exc
     return sheet_name, rows
 
 
@@ -477,8 +505,10 @@ def parse_catalog_sources(catalog_dir: Path | None) -> dict[str, Any]:
         header_idx = 0
         if len(rows) > 1 and any(_cell(v).lower() == "work item type" for v in rows[1]):
             header_idx = 1
-        headers = _header_map(list(rows[header_idx]))
-        wit_col = headers.get("Work item type")
+        headers: dict[str, int] = {}
+        for name, index in _header_map(list(rows[header_idx])).items():
+            headers.setdefault(" ".join(name.lower().split()), index)
+        wit_col = headers.get("work item type")
         data_rows = rows[header_idx + 1 :]
         row_count = 0
         sample_titles: list[str] = []
@@ -493,7 +523,7 @@ def parse_catalog_sources(catalog_dir: Path | None) -> dict[str, Any]:
             if len(sample_titles) < 3:
                 # Title 1 often holds the hierarchy root/label
                 title = ""
-                for key in ("Title 1", "Title", "Name"):
+                for key in ("title 1", "title", "name"):
                     if key in headers and headers[key] < len(row):
                         title = _cell(row[headers[key]])
                         if title:
@@ -522,11 +552,14 @@ def parse_catalog_sources(catalog_dir: Path | None) -> dict[str, Any]:
 
 
 def validate_template_sheets(path: Path) -> list[str]:
-    wb = load_workbook(path, read_only=True, data_only=True)
     try:
-        present = set(wb.sheetnames)
-    finally:
-        wb.close()
+        wb = load_workbook(path, read_only=True, data_only=True)
+        try:
+            present = set(wb.sheetnames)
+        finally:
+            wb.close()
+    except _UNREADABLE_ERRORS as exc:
+        raise _unreadable_workbook(path, exc) from exc
     return [name for name in REQUIRED_TEMPLATE_SHEETS if name not in present]
 
 

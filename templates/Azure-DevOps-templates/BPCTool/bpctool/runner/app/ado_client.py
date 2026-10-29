@@ -20,9 +20,14 @@ USER_AGENT = "BPCTool-runner (python http.client)"
 REQUEST_TIMEOUT_S = 120
 # Azure front doors drop idle keep-alive sockets after a few minutes.
 IDLE_RECONNECT_S = 60.0
-MAX_RETRY_DELAY_S = 60.0
+# Longest Retry-After honoured: Azure DevOps measures usage over 5-minute windows.
+MAX_RETRY_DELAY_S = 300.0
+# How often a wait checks for Cancel.
+CANCEL_POLL_S = 0.5
 
-# Statuses where ADO did not process the request, so any method may be retried.
+# Statuses where ADO did not process the request, so any method may be retried. A 503
+# only counts when it carries rate-limit headers: a front door can answer 503 after a
+# backend timeout on a request that was saved.
 _REJECTED_STATUSES = {429, 503}
 # Additional statuses retried only for idempotent calls (request may have run).
 _IDEMPOTENT_RETRY_STATUSES = {500, 502, 504}
@@ -70,6 +75,10 @@ class AdoError(RuntimeError):
 
 class RunCancelled(Exception):
     """Raised at a safe checkpoint after the user cancels a job."""
+
+
+class _ConnectFailed(OSError):
+    """Opening the connection failed, so none of the request was sent."""
 
 
 def _proxy_for(scheme: str, host: str) -> Any:
@@ -145,19 +154,26 @@ class _ConnectionPool:
                 pass
 
 
+def _retry_after_seconds(retry_after: str | None) -> float | None:
+    """Seconds a Retry-After header asks for (seconds or HTTP-date); None when unreadable."""
+    if not retry_after:
+        return None
+    value = retry_after.strip()
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        return max(0.0, parsedate_to_datetime(value).timestamp() - time.time())
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 def retry_delay_seconds(retry_after: str | None, attempt: int) -> float:
-    """Honor Retry-After (seconds or HTTP-date); else jittered exponential backoff."""
-    if retry_after:
-        value = retry_after.strip()
-        try:
-            return min(MAX_RETRY_DELAY_S, max(0.0, float(value)))
-        except ValueError:
-            pass
-        try:
-            when = parsedate_to_datetime(value)
-            return min(MAX_RETRY_DELAY_S, max(0.0, when.timestamp() - time.time()))
-        except (TypeError, ValueError, OverflowError):
-            pass
+    """Honor Retry-After (up to MAX_RETRY_DELAY_S); else jittered exponential backoff."""
+    requested = _retry_after_seconds(retry_after)
+    if requested is not None:
+        return min(MAX_RETRY_DELAY_S, requested)
     base = min(30.0, 1.5 * (2**attempt))
     return base * (0.75 + random.random() * 0.5)
 
@@ -188,7 +204,7 @@ class _ThrottleGate:
         self._spacing_until = 0.0
         self._last_notice = float("-inf")
 
-    def wait(self) -> None:
+    def wait(self, sleep: Callable[[float], None] | None = None) -> None:
         with self._lock:
             now = time.monotonic()
             start = max(now, self._not_before)
@@ -196,7 +212,7 @@ class _ThrottleGate:
                 start = max(start, self._next_slot)
                 self._next_slot = start + self._spacing
         if start > now:
-            time.sleep(start - now)
+            (sleep or time.sleep)(start - now)
 
     def pause(self, seconds: float) -> None:
         if seconds <= 0:
@@ -242,6 +258,9 @@ class _ThrottleGate:
         what += f": {resource})" if resource else ")"
         if pause:
             action = f"pausing all requests for {pause:.0f} s"
+            requested = _retry_after_seconds(retry_after)
+            if requested is not None and requested > pause:
+                action += f" (Azure DevOps asked for {requested:.0f} s)"
         elif spacing:
             action = f"spacing requests {spacing:g} s apart for a while"
         else:
@@ -318,6 +337,27 @@ class AdoClient:
         self._gate = _ThrottleGate()
         # Called with a plain-language notice when Azure DevOps starts rate limiting.
         self.on_throttle: Callable[[str], None] | None = None
+        # Called before every request; may raise to stop a step (e.g. on Cancel).
+        self.before_request: Callable[[], None] | None = None
+        # True once the run is cancelled: a throttle pause or retry wait then stops with
+        # RunCancelled, before the request is (re)sent.
+        self.cancel_waits: Callable[[], bool] | None = None
+
+    def _sleep(self, seconds: float) -> None:
+        if seconds <= 0:
+            return
+        cancelled = self.cancel_waits
+        if cancelled is None:
+            time.sleep(seconds)
+            return
+        end = time.monotonic() + seconds
+        while True:
+            if cancelled():
+                raise RunCancelled("Run cancelled by user")
+            left = end - time.monotonic()
+            if left <= 0:
+                return
+            time.sleep(min(left, CANCEL_POLL_S))
 
     def url(self, path: str, *, project: str | None = None, api_version: str | None = None) -> str:
         version = api_version or self.api_version
@@ -347,9 +387,12 @@ class AdoClient:
         """Send a request with retries.
 
         ``idempotent=False`` (work item create) never retries after the request
-        may have reached ADO: network errors and 500/502/504 raise ``outcome_unknown``
-        and only 429/503 rejections are retried.
+        may have reached ADO: network errors once connected, 500/502/504 and a 503
+        without rate-limit headers raise ``outcome_unknown``. Failures to connect,
+        429, and 503 with rate-limit headers are retried.
         """
+        if self.before_request:
+            self.before_request()
         url = absolute_url or self.url(path, project=project, api_version=api_version)
         data = None
         headers = {
@@ -367,11 +410,11 @@ class AdoClient:
         attempts = max(1, retry_attempts)
         for attempt in range(attempts):
             last = attempt == attempts - 1
-            self._gate.wait()
+            self._gate.wait(self._sleep)
             try:
                 status, reason, rate_headers, raw = self._send(method.upper(), url, data, headers)
             except (http.client.HTTPException, OSError) as exc:
-                if not idempotent:
+                if not idempotent and not isinstance(exc, _ConnectFailed):
                     raise AdoError(
                         f"Network error talking to Azure DevOps (outcome unknown, not retried): {exc}",
                         transient=True,
@@ -381,7 +424,7 @@ class AdoClient:
                     raise AdoError(
                         f"Network error talking to Azure DevOps: {exc}", transient=True
                     ) from exc
-                time.sleep(retry_delay_seconds(None, attempt))
+                self._sleep(retry_delay_seconds(None, attempt))
                 continue
 
             rate_headers = rate_headers or {}
@@ -402,11 +445,23 @@ class AdoClient:
             if 200 <= status < 300:
                 if not raw:
                     return None
-                return json.loads(raw.decode("utf-8"))
+                try:
+                    return json.loads(raw.decode("utf-8"))
+                except ValueError as exc:
+                    prefix = raw[:60].decode("utf-8", errors="replace")
+                    raise AdoError(
+                        f"ADO {status} {reason}: the response isn't JSON (starts {prefix!r})"
+                        + ("" if idempotent else "; outcome unknown, not retried: "
+                           "Azure DevOps may have done it anyway"),
+                        status=status,
+                        transient=True,
+                        outcome_unknown=not idempotent,
+                    ) from exc
 
             body = raw.decode("utf-8", errors="replace")[:500]
             transient = status in _REJECTED_STATUSES | _IDEMPOTENT_RETRY_STATUSES
-            if not idempotent and status in _IDEMPOTENT_RETRY_STATUSES:
+            unthrottled_503 = status == 503 and not rate_headers
+            if not idempotent and (status in _IDEMPOTENT_RETRY_STATUSES or unthrottled_503):
                 raise AdoError(
                     f"ADO {status} {reason}: {body} (outcome unknown, not retried: "
                     "Azure DevOps may have done it anyway)",
@@ -420,7 +475,7 @@ class AdoClient:
             if status in _REJECTED_STATUSES:
                 self._gate.pause(delay)
             else:
-                time.sleep(delay)
+                self._sleep(delay)
         raise AdoError("ADO request failed after retries", transient=True)
 
     def _send(
@@ -432,6 +487,12 @@ class AdoClient:
         if http_proxy_headers is not None:
             target = url
             headers = {**headers, **http_proxy_headers}
+        if conn.sock is None:
+            try:
+                conn.connect()
+            except (http.client.HTTPException, OSError) as exc:
+                self._pool.discard(parts.scheme, parts.netloc)
+                raise _ConnectFailed(f"couldn't connect: {exc}") from exc
         try:
             conn.request(method, target, body=data, headers=headers)
             response = conn.getresponse()

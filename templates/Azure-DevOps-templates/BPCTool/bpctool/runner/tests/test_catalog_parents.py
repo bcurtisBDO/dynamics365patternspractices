@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from app.catalog_import import (
     WorkItemDraft,
     _fill_title_hierarchy_parents,

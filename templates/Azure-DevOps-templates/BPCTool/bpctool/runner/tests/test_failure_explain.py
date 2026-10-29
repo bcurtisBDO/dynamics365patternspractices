@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from app.catalog_import import WorkItemDraft
 from app.failure_explain import (
+    LOOKUP_FAILED_PREFIX,
     enrich_failures,
     explain_failure,
     summarize_failures,
@@ -62,6 +65,35 @@ def test_invalid_state() -> None:
     result = explain_failure(_ado(message, custom=True), draft)
     assert result["category"] == "invalid_state"
     assert "Deprecated" in result["problem"] and "System process" in result["problem"]
+
+
+def test_held_rows_and_unconfirmed_creates_say_rerun() -> None:
+    draft = _draft("a", **{"MSBPC.microsoftid": "M1"})
+    held = explain_failure(LOOKUP_FAILED_PREFIX + "ADO 503 Service Unavailable: busy", draft)
+    assert held["category"] == "lookup_failed"
+    assert held["value"] == "M1"
+    assert held["fix"].startswith("Re-run Catalog Import")
+    unconfirmed = explain_failure(
+        "Network error talking to Azure DevOps (outcome unknown, not retried): reset; "
+        "the work item didn't show up in Azure DevOps, so it wasn't created again",
+        draft,
+    )
+    assert unconfirmed["category"] == "network"
+    assert unconfirmed["fix"].startswith("Re-run Catalog Import")
+
+
+def test_server_error_on_create_is_an_unconfirmed_create(monkeypatch) -> None:
+    from app.ado_client import AdoClient, AdoError
+
+    client = AdoClient("https://dev.azure.com/contoso", "x" * 52)
+    body = json.dumps({"message": "TF246017: database error"}).encode()
+    monkeypatch.setattr(client, "_send", lambda *_a: (500, "Internal Server Error", {}, body))
+    with pytest.raises(AdoError) as caught:
+        client.create_work_item("Demo", "Scenario", {"System.Title": "x"})
+    error = f"{caught.value}; the work item didn't show up in Azure DevOps, so it wasn't created again"
+    result = explain_failure(error, _draft("a"))
+    assert result["category"] == "network"
+    assert result["fix"].startswith("Re-run Catalog Import")
 
 
 def test_auth_and_unknown_errors() -> None:

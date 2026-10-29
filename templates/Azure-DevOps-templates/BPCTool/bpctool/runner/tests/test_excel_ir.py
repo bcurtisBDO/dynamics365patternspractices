@@ -109,3 +109,70 @@ def test_dry_run_plan_sequence(template_path):
         "report",
     ]
     assert plan.steps[2]["depends_on"] == ["process", "layout"]
+
+
+def _template_with_areas(tmp_path, area_rows):
+    from openpyxl import Workbook
+
+    from app.excel_ir import REQUIRED_TEMPLATE_SHEETS
+
+    wb = Workbook()
+    wb.remove(wb.active)
+    for name in REQUIRED_TEMPLATE_SHEETS:
+        wb.create_sheet(name)
+    sheet = wb["Area paths"]
+    sheet.append(["Areas", None, None, None, None, "Teams"])
+    sheet.append(["Project name"])
+    for row in area_rows:
+        sheet.append(row)
+    path = tmp_path / "ADO template guideline.xlsx"
+    wb.save(path)
+    return path
+
+
+def test_area_path_row_skipping_a_level_is_a_clear_error(tmp_path):
+    import pytest
+    from fastapi import HTTPException
+
+    from app.main import dry_run
+    from app.models import DryRunRequest
+
+    path = _template_with_areas(
+        tmp_path,
+        [
+            [None, "Functional areas", None, None, None, "Finance"],
+            [None, None, None, "Asset financials", None, "Assets"],
+        ],
+    )
+    with pytest.raises(ValueError) as info:
+        parse_area_paths(path)
+    message = str(info.value)
+    assert message.startswith("Area paths sheet, row 4: 'Asset financials' is in the level 3 column (D)")
+    assert "no level 2 area" in message
+
+    request = DryRunRequest(
+        org_url="https://dev.azure.com/contoso", process_name="BPC", project_name="Proj",
+        excel_file=str(path),
+    )
+    with pytest.raises(HTTPException) as http_info:
+        dry_run(request)
+    assert http_info.value.status_code == 400
+    assert http_info.value.detail == message
+
+
+def test_area_path_rows_in_order_still_parse(tmp_path):
+    path = _template_with_areas(
+        tmp_path,
+        [
+            [None, "Functional areas", None, None, None, ""],
+            [None, None, "Finance", None, None, "Finance"],
+            [None, None, None, "Accounting", None, "Accounting"],
+            [None, "Business process catalog", "Acquire to dispose", None, None, "BPC"],
+        ],
+    )
+    assert [(a["path"], a["depth"]) for a in parse_area_paths(path)] == [
+        ("Functional areas", 0),
+        ("Functional areas\\Finance", 1),
+        ("Functional areas\\Finance\\Accounting", 2),
+        ("Business process catalog\\Acquire to dispose", 1),
+    ]

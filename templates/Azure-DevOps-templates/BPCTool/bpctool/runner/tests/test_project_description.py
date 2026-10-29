@@ -12,17 +12,28 @@ from app.writers.project import apply_project
 
 class FakeClient:
     def __init__(
-        self, *, existing_id: str | None = None, existing_process: str = "proc-guid"
+        self,
+        *,
+        existing_id: str | None = None,
+        existing_process: str = "proc-guid",
+        existing_description: str = "",
     ) -> None:
         self.existing_id = existing_id
         self.existing_process = existing_process
+        self.existing_description = existing_description
         self.created: dict[str, Any] | None = None
         self.updated: dict[str, Any] | None = None
+        self.should_cancel: Any = None
+
+    def get(self, path: str, **_kwargs: Any) -> dict[str, Any]:
+        assert path == f"/_apis/projects/{self.existing_id}"
+        return {"id": self.existing_id, "description": self.existing_description}
 
     def get_process_id(self, _name: str) -> str:
         return "proc-guid"
 
-    def get_project_id(self, _name: str) -> str | None:
+    def get_ready_project_id(self, _name: str, *, should_cancel: Any = None, on_wait: Any = None) -> str | None:
+        self.should_cancel = should_cancel
         return self.existing_id
 
     def get_project_process_id(self, _project_id: str) -> str:
@@ -32,8 +43,9 @@ class FakeClient:
         return [{"typeId": "proc-guid", "name": "MSBPCTemplate"}, {"typeId": "agile-guid", "name": "Agile"}]
 
     def create_project(
-        self, project_name: str, process_id: str, *, description: str = ""
+        self, project_name: str, process_id: str, *, description: str = "", should_cancel: Any = None
     ) -> str:
+        self.should_cancel = should_cancel
         self.created = {
             "name": project_name,
             "process_id": process_id,
@@ -120,3 +132,50 @@ def test_existing_project_on_another_process_is_rejected() -> None:
     with pytest.raises(AdoError, match='uses process "Agile", not "MSBPCTemplate"'):
         apply_project(client, ir, dry_run=False, emit=lambda _s, _m: None)
     assert client.updated is None
+
+
+def test_unchanged_description_is_not_sent_again() -> None:
+    client = FakeClient(existing_id="proj-existing", existing_description="Same text")
+    events: list[str] = []
+    ir = {"targets": {"project_name": "MSBPCProj", "process_name": "MSBPCTemplate", "project_description": "Same text"}}
+    stats = apply_project(client, ir, dry_run=False, emit=lambda _s, m: events.append(m))
+    assert client.updated is None
+    assert stats["description_updated"] is False and "warnings" not in stats
+    assert any("already matches" in m for m in events)
+
+
+def test_cancel_check_is_passed_to_project_creation() -> None:
+    client = FakeClient()
+    ir = {"targets": {"project_name": "MSBPCProj", "process_name": "MSBPCTemplate"}}
+
+    def cancel() -> bool:
+        return False
+
+    apply_project(client, ir, dry_run=False, emit=lambda _s, _m: None, should_cancel=cancel)
+    assert client.should_cancel is cancel
+
+
+def test_existing_project_still_being_created_is_waited_for() -> None:
+    class StillCreating(FakeClient):
+        def get_ready_project_id(self, _name: str, *, should_cancel: Any = None, on_wait: Any = None) -> str:
+            on_wait("createPending")
+            return "proj-existing"
+
+    client = StillCreating(existing_id="proj-existing")
+    events: list[str] = []
+    ir = {"targets": {"project_name": "MSBPCProj", "process_name": "MSBPCTemplate"}}
+    stats = apply_project(client, ir, dry_run=False, emit=lambda _s, m: events.append(m))
+    assert stats["existed"] is True and stats["project_id"] == "proj-existing"
+    assert any("still being set up" in m and "createPending" in m for m in events)
+
+
+def test_description_is_sent_when_it_cannot_be_read() -> None:
+    class Unreadable(FakeClient):
+        def get(self, path: str, **_kwargs: Any) -> dict[str, Any]:
+            raise AdoError("ADO 500", status=500)
+
+    client = Unreadable(existing_id="proj-existing")
+    ir = {"targets": {"project_name": "MSBPCProj", "process_name": "MSBPCTemplate", "project_description": "New"}}
+    stats = apply_project(client, ir, dry_run=False, emit=lambda _s, _m: None)
+    assert client.updated == {"project_id": "proj-existing", "description": "New"}
+    assert stats["description_updated"] is True

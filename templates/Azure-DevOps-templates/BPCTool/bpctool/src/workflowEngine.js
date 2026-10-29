@@ -118,6 +118,20 @@ export function completionScope(executionMode, cacheKey) {
     : { key: `${executionMode}::${cacheKey}`, persisted: false }
 }
 
+/**
+ * Step ids from a runner job's `apply_result.step_results` that actually ran. Steps the
+ * runner skipped by plan/policy (`{ skipped: true }`) or that failed must not be cached as
+ * completed, or later Full runs would skip work that never happened.
+ */
+export function stepsThatRan(stepResults) {
+  if (!stepResults || typeof stepResults !== 'object') {
+    return []
+  }
+  return Object.entries(stepResults)
+    .filter(([, result]) => result?.skipped !== true && !result?.error)
+    .map(([stepId]) => stepId)
+}
+
 const sleep = (ms, signal) =>
   new Promise((resolve, reject) => {
     if (signal?.aborted) {

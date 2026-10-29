@@ -323,7 +323,7 @@ def _ir_with_areas() -> dict:
     ir["project"] = {
         "area_paths": [
             {"path": "Business process catalog\\Acquire to dispose"},
-            {"path": "Project name\\Functional areas\\Finance"},
+            {"path": "Functional areas\\Finance"},
         ]
     }
     return ir
@@ -365,7 +365,11 @@ def test_iteration_path_project_prefix_is_fixed_never_removed() -> None:
         {"path": "Phase 1 - Initiate"},
         {"path": "Phase 1 - Initiate\\Sprint 1"},
     ]
-    root_only = _draft("a", **{"System.IterationPath": "MSBPCProj"})
+    # The area path shows MSBPCProj is the catalog's old project name.
+    root_only = _draft(
+        "a",
+        **{"System.IterationPath": "MSBPCProj", "System.AreaPath": "MSBPCProj\\Business process catalog"},
+    )
     nested = _draft("b", **{"System.IterationPath": "MSBPCProj\\phase 1 - initiate\\Sprint 1"})
     relative = _draft("c", **{"System.IterationPath": "Phase 1 - Initiate"})
     already = _draft("d", **{"System.IterationPath": "NewProj\\Unknown sprint"})
@@ -374,7 +378,25 @@ def test_iteration_path_project_prefix_is_fixed_never_removed() -> None:
     assert nested.fields["System.IterationPath"] == "NewProj\\Phase 1 - Initiate\\Sprint 1"
     assert relative.fields["System.IterationPath"] == "NewProj\\Phase 1 - Initiate"
     assert already.fields["System.IterationPath"] == "NewProj\\Unknown sprint"
-    assert result.counts == {"area_path_project_renamed": 3}
+    assert result.counts == {"area_path_project_renamed": 4}
+
+
+def test_unknown_single_segment_iteration_path_needs_review() -> None:
+    from app.catalog_validate import prevalidate_summary
+
+    ir = _ir_with_areas()
+    ir["project"]["iteration_paths"] = [{"path": "Phase 1 - Initiate"}]
+    sprint = _draft("a", **{"System.IterationPath": "Sprint 9"})
+    placeholder = _draft("b", **{"System.IterationPath": "Project"})
+    result = prevalidate_catalog_drafts([sprint, placeholder], ir, _mapping())
+    assert sprint.fields["System.IterationPath"] == "NewProj"
+    assert placeholder.fields["System.IterationPath"] == "NewProj"
+    assert result.counts == {"invalid_iteration_path": 1}
+    issue = result.issues[0]
+    assert (issue.key, issue.source_file, issue.source_row, issue.new_value) == ("a", "bpc.xlsx", 7, "NewProj")
+    review = prevalidate_summary(result)["needsReview"]
+    assert [g["kind"] for g in review] == ["invalid_iteration_path"]
+    assert review[0]["examples"][0]["value"] == "Sprint 9"
 
 
 def test_area_path_from_another_project_is_rewritten() -> None:
@@ -382,6 +404,15 @@ def test_area_path_from_another_project_is_rewritten() -> None:
     result = prevalidate_catalog_drafts([draft], _ir_with_areas(), _mapping())
     assert draft.fields["System.AreaPath"] == "NewProj\\Business process catalog\\Acquire to dispose"
     assert result.counts == {"area_path_project_renamed": 1}
+
+
+def test_level_one_area_named_like_the_project_is_kept() -> None:
+    ir = _ir_with_areas()
+    ir["project"]["area_paths"].append({"path": "NewProj\\AP"})
+    draft = _draft("a", **{"System.AreaPath": "NewProj\\NewProj\\AP"})
+    result = prevalidate_catalog_drafts([draft], ir, _mapping())
+    assert draft.fields["System.AreaPath"] == "NewProj\\NewProj\\AP"
+    assert not result.issues
 
 
 def test_area_path_ancestor_and_project_root_are_valid() -> None:
@@ -437,6 +468,41 @@ def test_existing_project_area_is_accepted() -> None:
     )
     assert draft.fields["System.AreaPath"] == "NewProj\\Manual area"
     assert not result.issues
+
+
+def test_test_case_new_kept_when_process_step_adds_it() -> None:
+    draft = _draft("t", "Test Case", **{"System.State": "New"})
+    result = prevalidate_catalog_drafts(
+        [draft], _ir(), _mapping(), planned_states={"Test case": ["New"]}
+    )
+    assert draft.fields["System.State"] == "New"
+    assert "invalid_state" not in result.counts
+
+
+def test_rehearsal_counts_planned_state_with_live_states() -> None:
+    draft = _draft("t", "Test Case", **{"System.State": "new"})
+    result = prevalidate_catalog_drafts(
+        [draft],
+        _ir(),
+        _mapping(),
+        allowed_states={"Test Case": ["Design", "Ready", "Closed"]},
+        planned_states={"Test case": ["New"]},
+    )
+    assert draft.fields["System.State"] == "New"
+    assert result.counts == {"state_case_normalized": 1}
+
+
+def test_live_states_decide_when_no_state_is_planned() -> None:
+    dropped = _draft("a", "Test Case", **{"System.State": "New"})
+    kept = _draft("b", "Test Case", **{"System.State": "New"})
+    prevalidate_catalog_drafts(
+        [dropped], _ir(), _mapping(), allowed_states={"Test Case": ["Design", "Ready", "Closed"]}
+    )
+    prevalidate_catalog_drafts(
+        [kept], _ir(), _mapping(), allowed_states={"Test Case": ["New", "Design", "Ready", "Closed"]}
+    )
+    assert "System.State" not in dropped.fields
+    assert kept.fields["System.State"] == "New"
 
 
 def test_state_checked_against_live_states() -> None:

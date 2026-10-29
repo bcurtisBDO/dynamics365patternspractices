@@ -42,16 +42,34 @@ export async function runnerFetch(url, options) {
   return response
 }
 
+const formatValidationIssue = (issue) => {
+  if (!issue || typeof issue !== 'object') {
+    return String(issue)
+  }
+  const loc = (Array.isArray(issue.loc) ? issue.loc : []).filter((part) => part !== 'body')
+  const msg = issue.msg || JSON.stringify(issue)
+  return loc.length ? `${loc.join('.')}: ${msg}` : msg
+}
+
+/** Readable message for a runner error payload (string detail or FastAPI 422 list). */
+export function runnerErrorMessage(payload, status, fallback = 'Runner error') {
+  const detail = payload?.detail
+  if (typeof detail === 'string' && detail) {
+    return detail
+  }
+  if (Array.isArray(detail) && detail.length) {
+    return detail.map(formatValidationIssue).join('; ')
+  }
+  if (detail) {
+    return JSON.stringify(detail)
+  }
+  return `${fallback} (${status})`
+}
+
 async function parsePayload(response) {
   const payload = await response.json().catch(() => ({}))
   if (!response.ok) {
-    const detail =
-      typeof payload.detail === 'string'
-        ? payload.detail
-        : payload.detail
-          ? JSON.stringify(payload.detail)
-          : `Runner error (${response.status})`
-    const error = new Error(detail)
+    const error = new Error(runnerErrorMessage(payload, response.status))
     error.status = response.status
     throw error
   }
@@ -170,13 +188,17 @@ export function buildRunnerJobBody({
   rootAreaPath,
   mode = 'apply',
   applyDryRun = false,
-  steps = null,
+  steps,
   catalogLimit = null,
   convertMarkdownToHtml = false,
   includeDeprecatedDeleted = false,
   catalogParallelWorkers = 4,
   outputRoot = '',
 }) {
+  // The runner treats a missing/null step list as "run every step".
+  if (!Array.isArray(steps) || steps.length === 0) {
+    throw new Error('Nothing to run: no workflow steps are planned.')
+  }
   return {
     org_url: orgUrl,
     pat,
@@ -194,7 +216,7 @@ export function buildRunnerJobBody({
     root_area_path: rootAreaPath || projectName,
     mode,
     apply_dry_run: Boolean(applyDryRun),
-    steps,
+    steps: [...steps],
     catalog_limit: catalogLimit,
     convert_markdown_to_html: Boolean(convertMarkdownToHtml),
     include_deprecated_deleted: Boolean(includeDeprecatedDeleted),

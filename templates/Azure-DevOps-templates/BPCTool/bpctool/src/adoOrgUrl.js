@@ -2,6 +2,9 @@
  * Azure DevOps organization URL helpers (SaaS only).
  */
 
+const BARE_ORG = /^([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9])$/
+const SCHEMELESS_VSSO = /^[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9]\.visualstudio\.com(\/.*)?$/i
+
 export function parseAdoOrgUrl(raw) {
   const s = String(raw || '').trim()
   if (!s) {
@@ -11,12 +14,11 @@ export function parseAdoOrgUrl(raw) {
   let toParse = s
 
   if (!/^https?:\/\//i.test(s)) {
-    const bareOrg = /^([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9])$/
-    if (bareOrg.test(s) && !s.includes('/') && !s.includes('.') && !s.includes(':')) {
+    if (BARE_ORG.test(s) && !s.includes('/') && !s.includes('.') && !s.includes(':')) {
       toParse = `https://dev.azure.com/${s}`
     } else if (/^dev\.azure\.com\//i.test(s)) {
       toParse = `https://${s}`
-    } else if (/^[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9]\.visualstudio\.com$/i.test(s)) {
+    } else if (SCHEMELESS_VSSO.test(s)) {
       toParse = `https://${s}`
     } else {
       return {
@@ -51,6 +53,13 @@ export function parseAdoOrgUrl(raw) {
     }
 
     const org = parts[0]
+    if (!BARE_ORG.test(org)) {
+      return {
+        ok: false,
+        error:
+          'The part after dev.azure.com must be your organization name (letters, digits and hyphens, for example https://dev.azure.com/yourorg).',
+      }
+    }
     return {
       ok: true,
       org,
@@ -96,7 +105,7 @@ export function normalizeAdoOrgUrl(raw) {
   const s = String(raw || '').trim()
   let toInspect = s
   if (!/^https?:\/\//i.test(s)) {
-    if (/^[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9]\.visualstudio\.com$/i.test(s)) {
+    if (SCHEMELESS_VSSO.test(s)) {
       toInspect = `https://${s}`
     } else if (/^dev\.azure\.com\//i.test(s)) {
       toInspect = `https://${s}`
